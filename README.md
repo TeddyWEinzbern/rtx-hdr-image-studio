@@ -37,6 +37,8 @@ Check the upstream [NVIDIA Windows requirements](https://docs.nvidia.com/maxine/
 
 The application never installs dependencies. Run the following commands yourself in a terminal. Do not run them inside the Python interactive prompt.
 
+Versioned source ZIPs, Python source distributions, wheels, and SHA-256 checksums are available on the [Releases page](https://github.com/TeddyWEinzbern/rtx-hdr-image-studio/releases). The source ZIP is the easiest option for following the steps below. A wheel is a Python package, not a standalone executable; release notes include its manual installation command.
+
 1. Install [Python 3.12 x64](https://www.python.org/downloads/) and a compatible [NVIDIA graphics driver](https://www.nvidia.com/Download/index.aspx).
 2. Download this repository's ZIP and extract it, or clone it:
 

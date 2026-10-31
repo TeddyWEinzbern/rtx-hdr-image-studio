@@ -17,3 +17,7 @@ Install the `gpu` extra separately for RTX tests. See [testing](docs/testing.md)
 Keep output dimensions unchanged. Do not add installers, automatic package downloads, telemetry, or changes to system HDR/ACM/wallpaper settings. Validate input settings before GPU initialization. Preserve native SDK output lifetime synchronization, full linear HDR range, subprocess cancellation, and non-overwriting export behavior.
 
 Add tests for behavioral changes, especially color conversion, validation, export integrity, and cleanup after failure. Do not make CI depend on an NVIDIA GPU. Declare AI assistance in your contribution when applicable. By contributing, you agree that your project-authored changes are distributed under the repository's MIT License.
+
+## Releases
+
+Update the version in `pyproject.toml` and `src/rtx_hdr_studio/__init__.py` together, then add `docs/releases/vX.Y.Z.md`. A push of versioned release notes to `main` triggers the release workflow. It runs CPU tests and packaging on a Windows runner, generates checksums, and publishes a tag and release assets only after those checks pass. It can also be started manually from GitHub Actions. Existing releases are not overwritten. Review the notes before pushing: adding or updating a matching release-notes file on `main` is a publication action.
