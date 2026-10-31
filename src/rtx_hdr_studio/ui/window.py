@@ -1,0 +1,601 @@
+"""English desktop interface; delegates color, files, and GPU work to other layers."""
+
+import json
+import uuid
+from pathlib import Path
+
+import numpy as np
+from PySide6.QtCore import Qt, QTimer, QUrl
+from PySide6.QtGui import (
+    QColor,
+    QDesktopServices,
+    QFont,
+    QImage,
+    QKeySequence,
+    QPalette,
+    QPixmap,
+    QShortcut,
+)
+from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QFileDialog,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QMainWindow,
+    QMessageBox,
+    QProgressBar,
+    QPushButton,
+    QScrollArea,
+    QVBoxLayout,
+    QWidget,
+)
+
+from .. import __version__
+from ..image_io import SUPPORTED, load_image
+from ..runtime import cache_dir, output_dir
+from ..settings import HdrSettings
+from .canvas import CompareCanvas
+from .controls import Parameter
+from .jobs import JobRunner
+
+PRESETS = {
+    "NVIDIA default": HdrSettings(),
+    "Soft photo": HdrSettings(luminance=600, contrast=95, saturation=90, middle_gray=45),
+    "Bright highlights": HdrSettings(luminance=1000, contrast=115, saturation=110),
+}
+STYLE = """
+QWidget { color: #e6eaf1; font-family: 'Segoe UI'; font-size: 13px; }
+QMainWindow, QWidget#root { background: #14181e; }
+QScrollArea, QListWidget { background: #1c222b; border: 1px solid #333c49; border-radius: 8px; }
+QWidget#settings { background: #1c222b; }
+QPushButton { background: #2b3542; border: 1px solid #435064; border-radius: 6px; padding: 8px 12px; }
+QPushButton:hover { background: #3a495a; }
+QPushButton:disabled { color: #75808d; background: #202731; }
+QPushButton#primary { background: #8bd89a; color: #12251a; font-weight: 600; }
+QComboBox, QDoubleSpinBox, QLineEdit { background: #11171f; padding: 5px; border: 1px solid #46546a; border-radius: 5px; }
+QComboBox QAbstractItemView { background: #202a37; selection-background-color: #355c44; }
+QLabel#title { font-size: 24px; font-weight: 600; }
+QLabel#muted { color: #a6b1c1; }
+QLabel#notice { background: #202935; padding: 10px; border-radius: 6px; }
+QListWidget::item { padding: 10px; border-radius: 5px; }
+QListWidget::item:selected { background: #355442; }
+QSlider::groove:horizontal { height: 4px; background: #3b4655; }
+QSlider::sub-page:horizontal { background: #8bd89a; }
+QSlider::handle:horizontal { background: #b7e6c0; width: 12px; margin: -5px 0; border-radius: 5px; }
+QProgressBar { background: #283241; border: none; height: 5px; }
+QProgressBar::chunk { background: #8bd89a; }
+"""
+
+
+def pixmap(rgb: np.ndarray) -> QPixmap:
+    rgb = np.ascontiguousarray(rgb, dtype=np.uint8)
+    h, w = rgb.shape[:2]
+    return QPixmap.fromImage(QImage(rgb.data, w, h, w * 3, QImage.Format.Format_RGB888).copy())
+
+
+class StudioWindow(QMainWindow):
+    def __init__(self, initial_files=()):
+        super().__init__()
+        self.setWindowTitle(f"RTX HDR Image Studio {__version__}")
+        self.setMinimumSize(1060, 740)
+        self.resize(1320, 880)
+        self.setAcceptDrops(True)
+        self.files: list[str] = []
+        self.results: dict[str, dict] = {}
+        self.outputs: dict[str, str] = {}
+        self.job: JobRunner | None = None
+        self.destination = output_dir()
+        self.last_log: Path | None = None
+        self._applying = False
+        self._build()
+        self.setStyleSheet(STYLE)
+        self.apply_settings(HdrSettings())
+        for shortcut, action in (
+            ("Ctrl+O", self.choose_files),
+            ("Ctrl+R", self.preview),
+            ("Ctrl+E", self.export),
+        ):
+            QShortcut(QKeySequence(shortcut), self, action)
+        if initial_files:
+            QTimer.singleShot(0, lambda: self.add_files(initial_files))
+
+    def _build(self):
+        root = QWidget()
+        root.setObjectName("root")
+        self.setCentralWidget(root)
+        outer = QVBoxLayout(root)
+        outer.setContentsMargins(18, 18, 18, 18)
+        heading = QLabel("RTX HDR Image Studio")
+        heading.setObjectName("title")
+        outer.addWidget(heading)
+        subtitle = QLabel("Local NVIDIA TrueHDR processing | Native HDR preview | FP16 JPEG XR")
+        subtitle.setObjectName("muted")
+        outer.addWidget(subtitle)
+        toolbar = QHBoxLayout()
+        self.add_button = self.button("Add images", self.choose_files, toolbar)
+        self.preview_button = self.button("Generate preview", self.preview, toolbar)
+        self.export_button = self.button("Export JXR", self.export, toolbar)
+        self.export_button.setObjectName("primary")
+        self.open_button = self.button("Open HDR result", self.open_result, toolbar)
+        self.cancel_button = self.button("Cancel", self.cancel, toolbar)
+        self.cancel_button.hide()
+        toolbar.addStretch()
+        self.button("Help / About", self.show_help, toolbar)
+        outer.addLayout(toolbar)
+        body = QHBoxLayout()
+        left = QVBoxLayout()
+        self.queue = QListWidget()
+        self.queue.setAccessibleName("Image queue")
+        self.queue.setFixedWidth(190)
+        self.queue.currentRowChanged.connect(self.select_file)
+        left.addWidget(self.queue)
+        self.clear_button = self.button("Clear queue", self.clear_files, left)
+        body.addLayout(left)
+        center = QVBoxLayout()
+        self.image_title = QLabel("Add an SDR image to begin")
+        center.addWidget(self.image_title)
+        self.image_info = QLabel("Original dimensions are preserved on export.")
+        self.image_info.setWordWrap(True)
+        center.addWidget(self.image_info)
+        self.canvas = CompareCanvas()
+        center.addWidget(self.canvas, 1)
+        views = QHBoxLayout()
+        for title, mode in (
+            ("Split comparison", "split"),
+            ("Original", "before"),
+            ("Processed", "after"),
+        ):
+            self.button(title, lambda checked=False, m=mode: self.set_view(m), views)
+        center.addLayout(views)
+        display = QHBoxLayout()
+        self.display_mode = QComboBox()
+        self.display_mode.setAccessibleName("Preview display mode")
+        self.display_mode.addItem("Automatic HDR", True)
+        self.display_mode.addItem("SDR tone-mapped", False)
+        self.display_mode.currentIndexChanged.connect(
+            lambda: self.canvas.set_hdr_preference(self.display_mode.currentData())
+        )
+        display.addWidget(self.display_mode)
+        self.display_status = QLabel()
+        self.display_status.setWordWrap(True)
+        display.addWidget(self.display_status, 1)
+        center.addLayout(display)
+        self.notice = QLabel()
+        self.notice.setObjectName("notice")
+        self.notice.setWordWrap(True)
+        center.addWidget(self.notice)
+        self.canvas.display_changed.connect(self.update_notice)
+        body.addLayout(center, 1)
+        self.settings_panel = QScrollArea()
+        self.settings_panel.setFixedWidth(295)
+        self.settings_panel.setWidgetResizable(True)
+        self.settings_panel.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        content = QWidget()
+        content.setObjectName("settings")
+        right = QVBoxLayout(content)
+        self.preset = QComboBox()
+        self.preset.setAccessibleName("HDR preset")
+        self.preset.addItems([*PRESETS, "Custom"])
+        self.preset.currentTextChanged.connect(self.choose_preset)
+        right.addWidget(self.preset)
+        self.parameters = {}
+        for name, title, low, high, suffix, help_text in (
+            (
+                "luminance",
+                "Peak luminance",
+                400,
+                2000,
+                " nit",
+                "NVIDIA target peak; actual image and display peaks may differ.",
+            ),
+            ("contrast", "Contrast", 0, 200, "", "NVIDIA contrast enhancement."),
+            ("saturation", "Saturation", 0, 200, "", "NVIDIA color saturation enhancement."),
+            ("middle_gray", "Middle gray", 10, 100, "", "NVIDIA middle-gray reference."),
+            (
+                "exposure",
+                "Input exposure",
+                -3,
+                3,
+                " EV",
+                "Exposure applied in linear light before inference.",
+            ),
+        ):
+            control = Parameter(
+                title,
+                low,
+                high,
+                suffix=suffix,
+                decimals=2 if name == "exposure" else 0,
+                help_text=help_text,
+            )
+            control.changed.connect(self.parameter_changed)
+            self.parameters[name] = control
+            right.addWidget(control)
+        self.debanding = QCheckBox("NVIDIA debanding")
+        self.debanding.stateChanged.connect(self.parameter_changed)
+        right.addWidget(self.debanding)
+        self.transfer = QComboBox()
+        self.transfer.addItem("Standard sRGB input", "srgb")
+        self.transfer.addItem("Gamma 2.2 encoded input", "gamma22")
+        self.transfer.currentIndexChanged.connect(self.parameter_changed)
+        right.addWidget(self.transfer)
+        self.background = QComboBox()
+        self.background.addItem("Composite alpha on black", "black")
+        self.background.addItem("Composite alpha on white", "white")
+        self.background.currentIndexChanged.connect(self.parameter_changed)
+        right.addWidget(self.background)
+        self.device = Parameter(
+            "GPU index", 0, 15, help_text="CUDA device index; leave at 0 for a single GPU."
+        )
+        self.device.changed.connect(self.parameter_changed)
+        right.addWidget(self.device)
+        presets = QHBoxLayout()
+        self.button("Save preset", self.save_preset, presets)
+        self.button("Load preset", self.load_preset, presets)
+        right.addLayout(presets)
+        self.button("Reset parameters", lambda: self.apply_settings(HdrSettings()), right)
+        right.addWidget(QLabel("Output directory"))
+        self.output_field = QLineEdit(str(self.destination))
+        self.output_field.setReadOnly(True)
+        right.addWidget(self.output_field)
+        self.button("Choose directory", self.choose_output, right)
+        self.button("Open output directory", self.open_output, right)
+        note = QLabel(
+            "FP16 linear scRGB JXR\nOriginal size | No automatic resizing\nExisting files are never overwritten"
+        )
+        note.setWordWrap(True)
+        right.addWidget(note)
+        right.addStretch()
+        self.settings_panel.setWidget(content)
+        body.addWidget(self.settings_panel)
+        outer.addLayout(body, 1)
+        self.progress = QProgressBar()
+        self.progress.setFixedHeight(5)
+        self.progress.setTextVisible(False)
+        outer.addWidget(self.progress)
+        footer = QHBoxLayout()
+        self.status = QLabel("Ready. Processing stays on this computer.")
+        self.status.setWordWrap(True)
+        footer.addWidget(self.status, 1)
+        self.log_button = self.button("Open job log", self.open_log, footer)
+        self.log_button.setEnabled(False)
+        outer.addLayout(footer)
+        self.set_busy(False)
+
+    @staticmethod
+    def button(text, action, layout):
+        button = QPushButton(text)
+        button.clicked.connect(action)
+        layout.addWidget(button)
+        return button
+
+    def current_settings(self) -> HdrSettings:
+        return HdrSettings(
+            **{key: control.value() for key, control in self.parameters.items()},
+            debanding=self.debanding.isChecked(),
+            transfer=self.transfer.currentData(),
+            background=self.background.currentData(),
+            device=self.device.value(),
+        )
+
+    def apply_settings(self, settings: HdrSettings):
+        self._applying = True
+        for key, control in self.parameters.items():
+            control.set_value(getattr(settings, key))
+        self.device.set_value(settings.device)
+        self.debanding.setChecked(settings.debanding)
+        self.transfer.setCurrentIndex(self.transfer.findData(settings.transfer))
+        self.background.setCurrentIndex(self.background.findData(settings.background))
+        self.preset.setCurrentText(
+            next((name for name, value in PRESETS.items() if value == settings), "Custom")
+        )
+        self._applying = False
+        self.update_notice()
+
+    def choose_preset(self, name):
+        if not self._applying and name in PRESETS:
+            self.apply_settings(PRESETS[name])
+
+    def parameter_changed(self, *_):
+        if not self._applying:
+            self.preset.blockSignals(True)
+            self.preset.setCurrentText("Custom")
+            self.preset.blockSignals(False)
+            self.update_notice()
+
+    def selected_file(self):
+        index = self.queue.currentRow()
+        return self.files[index] if 0 <= index < len(self.files) else None
+
+    def choose_files(self):
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Add SDR images", "", "Images (*.png *.jpg *.jpeg *.webp *.bmp *.tif *.tiff)"
+        )
+        self.add_files(paths)
+
+    def add_files(self, paths):
+        if self.job:
+            return
+        for raw in paths:
+            path = Path(raw).resolve()
+            if (
+                path.is_file()
+                and path.suffix.lower() in SUPPORTED
+                and str(path).casefold() not in {p.casefold() for p in self.files}
+            ):
+                self.files.append(str(path))
+                self.queue.addItem(path.name)
+                self.queue.item(self.queue.count() - 1).setToolTip(str(path))
+        if self.queue.currentRow() < 0 and self.files:
+            self.queue.setCurrentRow(0)
+        self.set_busy(False)
+
+    def clear_files(self):
+        self.files.clear()
+        self.results.clear()
+        self.outputs.clear()
+        self.queue.clear()
+        self.canvas.set_images(QPixmap())
+        self.image_title.setText("Add an SDR image to begin")
+        self.image_info.setText("Original dimensions are preserved on export.")
+        self.set_busy(False)
+        self.update_notice()
+
+    def select_file(self, _index):
+        source = self.selected_file()
+        if not source:
+            return
+        try:
+            result = self.results.get(source)
+            if result:
+                self.canvas.set_images(
+                    QPixmap(result["before"]), QPixmap(result["after"]), result["hdr_preview"]
+                )
+                info = result["info"]
+            else:
+                rgb, info = load_image(source, self.background.currentData())
+                self.canvas.set_images(pixmap(rgb))
+            self.image_title.setText(Path(source).name)
+            self.image_title.setToolTip(source)
+            self.image_info.setText(f"{info['width']} x {info['height']} | {info['input_profile']}")
+            self.open_button.setEnabled(source in self.outputs and self.job is None)
+        except Exception as error:
+            self.canvas.set_images(QPixmap())
+            self.image_info.setText(str(error))
+        self.update_notice()
+
+    def set_view(self, mode):
+        self.canvas.mode = mode
+        self.canvas.update()
+
+    def update_notice(self):
+        canvas = self.canvas
+        display = canvas.display_info
+        if canvas.hdr_active:
+            self.display_status.setText(f"Native HDR | {display.bits}-bit output")
+            note = "HDR highlights and wide-gamut values are displayed directly. The original matches the Windows SDR white level."
+        elif canvas.hdr_error:
+            self.display_status.setText("SDR fallback: HDR surface unavailable")
+            note = "Toggle preview display mode to retry. Details are in the application log."
+        elif not canvas.prefer_hdr:
+            self.display_status.setText("SDR tone-mapped preview")
+            note = "Choose Automatic HDR to use an HDR-enabled display."
+        elif display.hdr_active:
+            self.display_status.setText("HDR ready | Generate a preview")
+            note = "Generate a preview to display native HDR in this window."
+        else:
+            self.display_status.setText(f"SDR preview | Display mode: {display.color_mode}")
+            note = (
+                "Native HDR requires an HDR display with Windows HDR enabled. ACM alone is not HDR."
+            )
+        result = self.results.get(self.selected_file())
+        if result:
+            if result["settings"] != self.current_settings().to_dict():
+                note = (
+                    "Parameters changed. Generate a preview to update the previous result.\n" + note
+                )
+            else:
+                note = (
+                    f"Image peak: {result['statistics']['peak_luminance_nits']:.0f} nit.\n" + note
+                )
+        self.notice.setText(note)
+        self.display_status.setToolTip(
+            f"{display.name}\nSDR white: {display.sdr_white_nits:.0f} nit\n{display.error}"
+        )
+
+    def preview(self):
+        if not self.job and self.selected_file():
+            self.start_job("preview", [self.selected_file()])
+
+    def export(self):
+        if not self.job and self.files:
+            self.start_job("export", self.files.copy())
+
+    def start_job(self, mode, files):
+        request = {
+            "mode": mode,
+            "files": files,
+            "settings": self.current_settings().to_dict(),
+            "output_dir": str(self.destination),
+            "job_dir": str(cache_dir() / "jobs" / uuid.uuid4().hex),
+        }
+        runner = JobRunner(request, self)
+        self.job = runner
+        self.last_log = runner.log_path
+        runner.event.connect(self.job_event)
+        runner.finished.connect(self.job_finished)
+        self.set_busy(True)
+        self.status.setText("Starting NVIDIA TrueHDR...")
+        self.log_button.setEnabled(True)
+        runner.start()
+
+    def set_busy(self, busy):
+        for widget in (self.add_button, self.clear_button, self.queue, self.settings_panel):
+            widget.setEnabled(not busy)
+        self.preview_button.setEnabled(not busy and bool(self.files))
+        self.export_button.setEnabled(not busy and bool(self.files))
+        self.open_button.setEnabled(not busy and self.selected_file() in self.outputs)
+        self.cancel_button.setVisible(busy)
+        self.progress.setRange(0, 0 if busy else 100)
+        if not busy:
+            self.progress.setValue(100 if self.results else 0)
+
+    def job_event(self, event):
+        kind = event.get("event")
+        if kind == "progress":
+            self.status.setText(
+                f"{event['index'] + 1}/{event['total']} | {event['filename']} | {event['message']}"
+            )
+        elif kind == "file_done":
+            result = event["result"]
+            self.results[result["source"]] = result
+            if result["output"]:
+                self.outputs[result["source"]] = result["output"]
+            if result["source"] == self.selected_file():
+                self.select_file(self.queue.currentRow())
+        elif kind == "file_error":
+            self.status.setText(f"Failed: {Path(event['source']).name}: {event['error']}")
+
+    def job_finished(self):
+        runner = self.job
+        outcome = runner.outcome
+        self.job = None
+        runner.deleteLater()
+        self.set_busy(False)
+        if outcome.get("cancelled"):
+            self.status.setText("Cancelled. Completed exports are retained.")
+        elif outcome.get("event") == "error":
+            self.status.setText("Processing failed. Open the job log for details.")
+            QMessageBox.warning(self, "Processing failed", outcome["message"])
+        else:
+            results = outcome.get("results", [])
+            good = [r for r in results if "error" not in r]
+            failed = [r for r in results if "error" in r]
+            exported = sum(bool(r["output"]) for r in good)
+            self.status.setText(
+                f"Completed: {len(good)} | Exported: {exported} | Failed: {len(failed)}"
+            )
+            if failed:
+                QMessageBox.warning(
+                    self,
+                    "Some images failed",
+                    "\n\n".join(f"{Path(r['source']).name}: {r['error']}" for r in failed[:5]),
+                )
+        self.update_notice()
+
+    def cancel(self):
+        if self.job:
+            self.job.cancel()
+            self.status.setText("Stopping the GPU worker...")
+
+    def choose_output(self):
+        chosen = QFileDialog.getExistingDirectory(self, "Output directory", str(self.destination))
+        if chosen:
+            self.destination = Path(chosen)
+            self.output_field.setText(chosen)
+
+    def open_output(self):
+        self.destination.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.destination)))
+
+    def open_result(self):
+        output = self.outputs.get(self.selected_file())
+        if output:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(output))
+
+    def open_log(self):
+        if self.last_log and self.last_log.exists():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.last_log)))
+
+    def save_preset(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save preset", "hdr-preset.json", "JSON (*.json)"
+        )
+        if path:
+            try:
+                Path(path).write_text(
+                    json.dumps(
+                        {"schema_version": 1, "settings": self.current_settings().to_dict()},
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+            except OSError as error:
+                QMessageBox.warning(self, "Cannot save preset", str(error))
+
+    def load_preset(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Load preset", "", "JSON (*.json)")
+        if path:
+            try:
+                data = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+                if not isinstance(data, dict):
+                    raise ValueError("A preset must contain a JSON object.")
+                if data.get("schema_version") != 1:
+                    raise ValueError("Unsupported preset schema version.")
+                self.apply_settings(HdrSettings.from_dict(data["settings"]))
+            except (OSError, ValueError, TypeError, KeyError) as error:
+                QMessageBox.warning(self, "Cannot load preset", str(error))
+
+    def show_help(self):
+        QMessageBox.information(
+            self,
+            "About RTX HDR Image Studio",
+            f"RTX HDR Image Studio {__version__}\nMIT License\n\n"
+            "Created with OpenAI Codex (ChatGPT), an AI coding assistant, under human direction.\n\n"
+            "1. Add SDR images and adjust the NVIDIA parameters.\n"
+            "2. Generate a preview; drag the comparison divider.\n"
+            "3. Export the queue to verified FP16 scRGB JXR.\n\n"
+            "Ctrl+O: add | Ctrl+R: preview | Ctrl+E: export\n\n"
+            "Windows wallpaper resizing may lose HDR. Prepare suitable input dimensions yourself. "
+            "This tool preserves export dimensions and does not change display or wallpaper settings.\n\n"
+            "Third-party dependencies, including NVIDIA software, retain their own licenses.",
+        )
+
+    def dragEnterEvent(self, event):
+        if not self.job and event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        self.add_files([url.toLocalFile() for url in event.mimeData().urls() if url.isLocalFile()])
+        event.acceptProposedAction()
+
+    def closeEvent(self, event):
+        if self.job:
+            self.job.cancel()
+            if not self.job.wait(5000):
+                self.status.setText("Waiting for the GPU worker to stop...")
+                event.ignore()
+                return
+        self.canvas.display_timer.stop()
+        self.canvas._disable_hdr()
+        event.accept()
+
+
+def run(initial_files=()) -> int:
+    app = QApplication.instance() or QApplication([])
+    app.setApplicationName("RTX HDR Image Studio")
+    app.setOrganizationName("RTX HDR Image Studio")
+    app.setStyle("Fusion")
+    app.setFont(QFont("Segoe UI", 9))
+    palette = QPalette()
+    for role, color in (
+        (QPalette.ColorRole.Window, "#1c222b"),
+        (QPalette.ColorRole.WindowText, "#e6eaf1"),
+        (QPalette.ColorRole.Base, "#14181e"),
+        (QPalette.ColorRole.Text, "#e6eaf1"),
+        (QPalette.ColorRole.Button, "#2b3542"),
+        (QPalette.ColorRole.ButtonText, "#e6eaf1"),
+        (QPalette.ColorRole.Highlight, "#355442"),
+        (QPalette.ColorRole.HighlightedText, "#e6eaf1"),
+    ):
+        palette.setColor(role, QColor(color))
+    app.setPalette(palette)
+    window = StudioWindow(initial_files)
+    geometry = app.primaryScreen().availableGeometry()
+    window.resize(min(1320, geometry.width() - 30), min(880, geometry.height() - 40))
+    window.show()
+    return app.exec()

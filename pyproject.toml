@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rtx-hdr-image-studio"
+version = "1.0.0"
+description = "A local Windows GUI for NVIDIA TrueHDR image processing and FP16 scRGB JPEG XR export."
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{name = "TeddyWEinzbern"}]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Operating System :: Microsoft :: Windows",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Multimedia :: Graphics :: Graphics Conversion",
+]
+dependencies = [
+  "numpy==2.3.4", "Pillow==12.0.0", "PySide6-Essentials==6.10.1",
+  "imagecodecs==2026.10.10",
+]
+
+[project.optional-dependencies]
+gpu = [
+  "cupy-cuda13x==14.2.0", "cuda-pathfinder==1.8.5",
+  "nvidia-cuda-runtime==13.0.96", "nvidia-cuda-nvrtc==13.0.88",
+  "nvidia-vfx @ https://pypi.nvidia.com/nvidia-vfx/nvidia_vfx-0.2.0.0-cp312-abi3-win_amd64.whl#sha256=cebaa12411f7e22b39293205c5c4d07b8073d14ca1e0e7727ee4375207a36445",
+]
+dev = ["pytest>=8,<10", "ruff>=0.14,<0.15", "build>=1.2,<2"]
+
+[project.gui-scripts]
+rtx-hdr-studio = "rtx_hdr_studio.__main__:main"
+
+[project.urls]
+Repository = "https://github.com/TeddyWEinzbern/rtx-hdr-image-studio"
+Issues = "https://github.com/TeddyWEinzbern/rtx-hdr-image-studio/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+markers = ["gpu: requires NVIDIA RTX hardware and installed GPU dependencies", "native: requires Windows Direct3D"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = [".local", ".venv", "dist", "build"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
