@@ -51,6 +51,8 @@ def test_fullscreen_native_hdr_rendering_and_exit(tmp_path, wait_until):
         pytest.skip("Set QT_QPA_PLATFORM=windows for actual full-screen HDR validation")
     window = StudioWindow()
     window.show()
+    window.raise_()
+    window.activateWindow()
     try:
         assert QTest.qWaitForWindowActive(window, 3000)
         if not query_display(int(window.canvas.winId())).hdr_active:

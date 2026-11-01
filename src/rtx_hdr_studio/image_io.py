@@ -6,60 +6,147 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageCms, ImageOps
 
+from .resources import (
+    MAX_PIXELS,
+    empty_image,
+    release_image,
+    require_memory,
+    strip_rows,
+    validate_size,
+)
+
 SUPPORTED = frozenset({".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"})
-MAX_PIXELS = 40_000_000
+# A finite decoder guard, shared by workers and background GUI loaders.
+Image.MAX_IMAGE_PIXELS = MAX_PIXELS
 PREVIEW_BOUNDS = (3840, 2160)
+LARGE_IMAGE_PIXELS = 40_000_000  # Switch to bounded resampling, not an input limit.
+PREVIEW_FILTER = Image.Resampling.LANCZOS
+REDUCING_GAP = 3.0  # Area prefilter for large reductions, then a Lanczos-3 finish.
 
 
-def load_image(path: str | Path, background: str = "black") -> tuple[np.ndarray, dict]:
+def _info(opened, path):
+    width, height = opened.size
+    validate_size(width, height)
+    # PNG's getexif override decodes IDAT when eXIf is absent. Header queries
+    # must never decode pixels, especially before resource/size validation.
+    if Image.Image.getexif(opened).get(274) in (5, 6, 7, 8):
+        width, height = height, width
+    validate_size(width, height)
+    profile = None
+    name = "Untagged; interpreted as sRGB"
+    if icc := opened.info.get("icc_profile"):
+        try:
+            profile = ImageCms.ImageCmsProfile(io.BytesIO(icc))
+            name = ImageCms.getProfileName(profile).strip()
+        except (OSError, ValueError, ImageCms.PyCMSError) as error:
+            raise ValueError("Invalid ICC profile. Convert the source to sRGB first.") from error
+    return {
+        "filename": path.name,
+        "width": width,
+        "height": height,
+        "input_profile": name,
+        "transparency_composited": "A" in opened.getbands() or "transparency" in opened.info,
+    }, profile
+
+
+def image_info(path):
+    path = Path(path)
+    with Image.open(path) as opened:
+        return _info(opened, path)[0]
+
+
+def load_image(
+    path: str | Path, background: str = "black", *, preview=False
+) -> tuple[np.ndarray, dict]:
     path = Path(path)
     if path.suffix.lower() not in SUPPORTED:
         raise ValueError("Choose a PNG, JPEG, WebP, BMP, or TIFF image.")
     if background not in ("black", "white"):
         raise ValueError("Background must be black or white.")
     with Image.open(path) as opened:
-        if opened.width * opened.height > MAX_PIXELS:
-            raise ValueError("Input exceeds 40 megapixels. Resize the source before processing.")
-        icc = opened.info.get("icc_profile")
-        image = ImageOps.exif_transpose(opened)
-        has_alpha = "A" in image.getbands() or "transparency" in image.info
-        alpha = image.convert("RGBA").getchannel("A") if has_alpha else None
-        rgb = image.convert("RGB")
-        profile_name = "Untagged; interpreted as sRGB"
-        if icc:
+        info, profile = _info(opened, path)
+        orientation = Image.Image.getexif(opened).get(274, 1)
+        if preview:
+            bounds = PREVIEW_BOUNDS[::-1] if orientation in (5, 6, 7, 8) else PREVIEW_BOUNDS
+            opened.draft("RGB", bounds)
+        require_memory(opened.width * opened.height * 8, "image decoding")
+        opened.load()
+        # PNG may contain EXIF after IDAT. It is now safe to inspect it.
+        if opened.format == "PNG":
+            opened._exif = None
+        actual_orientation = opened.getexif().get(274, 1)
+        if (actual_orientation in (5, 6, 7, 8)) != (orientation in (5, 6, 7, 8)):
+            info["width"], info["height"] = info["height"], info["width"]
+        orientation = actual_orientation
+        if preview:
+            bounds = PREVIEW_BOUNDS[::-1] if orientation in (5, 6, 7, 8) else PREVIEW_BOUNDS
+            opened.thumbnail(bounds, PREVIEW_FILTER, reducing_gap=REDUCING_GAP)
+        ImageOps.exif_transpose(opened, in_place=True)
+        transform = None
+        if profile:
             try:
-                profile = ImageCms.ImageCmsProfile(io.BytesIO(icc))
-                profile_name = ImageCms.getProfileName(profile).strip()
-                source = image if image.mode in ("CMYK", "LAB") else rgb
-                rgb = ImageCms.profileToProfile(
-                    source, profile, ImageCms.createProfile("sRGB"), outputMode="RGB"
+                mode = opened.mode if opened.mode in ("CMYK", "LAB") else "RGB"
+                transform = ImageCms.buildTransform(
+                    profile, ImageCms.createProfile("sRGB"), mode, "RGB"
                 )
             except (OSError, ValueError, ImageCms.PyCMSError) as error:
                 raise ValueError(
                     "Invalid ICC profile. Convert the source to sRGB first."
                 ) from error
-        if alpha is not None:
-            canvas = Image.new("RGB", rgb.size, background)
-            canvas.paste(rgb, mask=alpha)
-            rgb = canvas
-        return np.asarray(rgb, dtype=np.uint8).copy(), {
-            "filename": path.name,
-            "width": rgb.width,
-            "height": rgb.height,
-            "input_profile": profile_name,
-            "transparency_composited": has_alpha,
-        }
+        rgb = empty_image((opened.height, opened.width, 3), np.uint8)
+        rows = strip_rows(opened.width)
+        for y in range(0, opened.height, rows):
+            strip = opened.crop((0, y, opened.width, min(y + rows, opened.height)))
+            alpha = (
+                strip.convert("RGBA").getchannel("A") if info["transparency_composited"] else None
+            )
+            source = strip if strip.mode in ("CMYK", "LAB") else strip.convert("RGB")
+            converted = (
+                ImageCms.applyTransform(source, transform) if transform else source.convert("RGB")
+            )
+            if alpha is not None:
+                canvas = Image.new("RGB", converted.size, background)
+                canvas.paste(converted, mask=alpha)
+                converted = canvas
+            rgb[y : y + rows] = np.asarray(converted)
+        return rgb, info
 
 
 def resize_linear(rgb: np.ndarray, width: int, height: int, box=None) -> np.ndarray:
-    """Bilinear filtering in linear light, retaining negative and >1 samples."""
+    """Scale-aware Lanczos-3 with area prefilter; retain negative/HDR samples."""
     if box is None and rgb.shape[:2] == (height, width):
         return np.asarray(rgb, dtype=np.float32)
+    if box is None and rgb.shape[0] * rgb.shape[1] > LARGE_IMAGE_PIXELS:
+        # Separable filtering keeps all PIL F images small, even for huge sources.
+        intermediate = empty_image((rgb.shape[0], width, 3), np.float32)
+        rows = strip_rows(rgb.shape[1])
+        try:
+            for y in range(0, rgb.shape[0], rows):
+                band = rgb[y : y + rows]
+                for c in range(3):
+                    intermediate[y : y + rows, :, c] = np.asarray(
+                        Image.fromarray(np.asarray(band[..., c], np.float32)).resize(
+                            (width, len(band)), PREVIEW_FILTER, reducing_gap=REDUCING_GAP
+                        )
+                    )
+            output = np.empty((height, width, 3), np.float32)
+            columns = strip_rows(rgb.shape[0])
+            for x in range(0, width, columns):
+                for c in range(3):
+                    plane = np.asarray(intermediate[:, x : x + columns, c], np.float32)
+                    output[:, x : x + columns, c] = np.asarray(
+                        Image.fromarray(plane).resize(
+                            (plane.shape[1], height), PREVIEW_FILTER, reducing_gap=REDUCING_GAP
+                        )
+                    )
+            return output
+        finally:
+            release_image(intermediate)
     return np.stack(
         [
             np.asarray(
                 Image.fromarray(np.asarray(rgb[..., c], np.float32)).resize(
-                    (width, height), Image.Resampling.BILINEAR, box=box
+                    (width, height), PREVIEW_FILTER, box=box, reducing_gap=REDUCING_GAP
                 )
             )
             for c in range(3)
@@ -75,10 +162,12 @@ def preview_size(width: int, height: int) -> tuple[int, int]:
 
 
 def save_sdr_preview(path: Path, rgb: np.ndarray) -> None:
+    size = preview_size(rgb.shape[1], rgb.shape[0])
+    if rgb.shape[0] * rgb.shape[1] > LARGE_IMAGE_PIXELS:
+        rgb = np.clip(np.rint(resize_linear(rgb, *size)), 0, 255).astype(np.uint8)
     image = Image.fromarray(rgb)
-    size = preview_size(*image.size)
     if image.size != size:
-        image = image.resize(size, Image.Resampling.LANCZOS)
+        image = image.resize(size, PREVIEW_FILTER, reducing_gap=REDUCING_GAP)
     profile = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
     image.save(path, format="PNG", icc_profile=profile)
 

@@ -2,6 +2,7 @@ import json
 
 import imagecodecs
 import numpy as np
+import pytest
 from PIL import Image
 
 from rtx_hdr_studio.pipeline import process_files
@@ -20,6 +21,33 @@ class FakeEngine:
 
     def close(self):
         self.closed = True
+
+
+def test_resource_preflight_rejects_before_decode(tmp_path, monkeypatch):
+    from rtx_hdr_studio import pipeline
+
+    path = tmp_path / "image.png"
+    Image.new("RGB", (17, 13), "red").save(path)
+
+    class LimitedEngine(FakeEngine):
+        def check_resources(self, width, height):
+            assert (width, height) == (17, 13)
+            raise MemoryError("Insufficient commit headroom")
+
+    monkeypatch.setattr(pipeline, "load_image", lambda *_: pytest.fail("Decode must not start"))
+    engine = LimitedEngine(0)
+    result = process_files(
+        {
+            "mode": "preview",
+            "files": [str(path)],
+            "settings": HdrSettings().to_dict(),
+            "job_dir": str(tmp_path / "cache"),
+            "output_dir": str(tmp_path / "out"),
+        },
+        lambda _: None,
+        lambda _: engine,
+    )
+    assert "Insufficient commit headroom" in result[0]["error"] and engine.closed
 
 
 def test_batch_continues_and_closes_engine_with_valid_outputs(tmp_path):

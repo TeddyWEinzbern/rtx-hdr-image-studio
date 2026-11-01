@@ -30,9 +30,15 @@ def test_cancel_before_worker_start(tmp_path):
     from rtx_hdr_studio.ui.jobs import JobRunner
 
     app = QApplication.instance() or QApplication([])
+    scratch = tmp_path / "job" / "image-interrupted"
+    scratch.mkdir(parents=True)
+    (scratch / "0.bin").write_bytes(b"scratch")
+    completed = tmp_path / "job" / "0-after.png"
+    completed.write_bytes(b"completed cache")
     job = JobRunner({"job_dir": str(tmp_path / "job")})
     job.cancel()
     job.start()
     assert job.wait(5000)
     assert job.outcome == {"cancelled": True}
+    assert not scratch.exists() and completed.exists()
     app.processEvents()

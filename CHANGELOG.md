@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.2.0 - 2026-11-02
+
+- Set saturation to 150 for HDR400, HDR600, HDR1000, and HDR1000 Highlight presets.
+- Fix pixelated SDR downscaling and improve HDR/cache resampling with scale-aware Lanczos-3 and area prefiltering. Prepare final-size SDR images in the background and reuse them for divider/view changes; preserve the no-scaling path.
+- Raise the application input limit to 943,718,400 pixels and call NVIDIA's C API directly, bypassing the Python binding's large-image input-transfer failure.
+- Add a focused-image GPU memory estimate at the previewer's upper right, with fixed dedicated-VRAM capacity, pressure colors and shared-memory overflow.
+- Prevent simultaneous processing jobs across application instances in the same Windows session.
+- Reduce large-image memory pressure with strip-based color preparation/readback, mapped scratch storage, bounded resampling/statistics, preview-resolution tone mapping and mapped exact JXR verification. Check RAM/commit/disk headroom and clean interrupted scratch storage after the worker stops.
+- Keep header metadata queries independent of PNG decoding, and use reduced JPEG decoding and a single original-preview decode thread.
+
 ## 1.1.2 - 2026-11-01
 
 - Calculate the dropdown's final position before display, retaining screen-space checks for opening above or below and shortening long lists. Skip the native opening animation to prevent it from moving the popup back to a previous position.

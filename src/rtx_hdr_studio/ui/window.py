@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
 
 from .. import __version__
 from ..image_io import SUPPORTED
+from ..resources import gpu_capacity
 from ..runtime import cache_dir, output_dir
 from ..settings import HdrSettings
 from .canvas import CompareCanvas
@@ -42,14 +43,15 @@ from .controls import Parameter
 from .dropdown import Dropdown
 from .fullscreen import FullscreenPreview
 from .jobs import JobRunner
-from .preview_tasks import LatestTask, PreviewDevice, load_preview
+from .memory_usage import MemoryEstimate
+from .preview_tasks import IMAGE_POOL, LatestTask, PreviewDevice, load_preview, source_info
 
 PRESETS = {
     "NVIDIA default": HdrSettings(),
-    "HDR400": HdrSettings(luminance=400, middle_gray=50),
-    "HDR600": HdrSettings(luminance=640, middle_gray=80),
-    "HDR1000": HdrSettings(luminance=1000, middle_gray=100),
-    "HDR1000 Highlight": HdrSettings(luminance=1000, middle_gray=80),
+    "HDR400": HdrSettings(luminance=400, middle_gray=50, saturation=150),
+    "HDR600": HdrSettings(luminance=640, middle_gray=80, saturation=150),
+    "HDR1000": HdrSettings(luminance=1000, middle_gray=100, saturation=150),
+    "HDR1000 Highlight": HdrSettings(luminance=1000, middle_gray=80, saturation=150),
 }
 STYLE = """
 QWidget { color: #e6eaf1; font-family: 'Segoe UI'; font-size: 13px; }
@@ -101,9 +103,15 @@ class StudioWindow(QMainWindow):
         self._displayed_source = None
         self._closing = False
         self.preview_device = PreviewDevice(self)
-        self.preview_loader = LatestTask(self)
+        self.preview_loader = LatestTask(self, IMAGE_POOL)
         self.preview_loader.ready.connect(self._preview_loaded)
         self.preview_loader.failed.connect(self._preview_failed)
+        self.metadata_loader = LatestTask(self)
+        self.metadata_loader.ready.connect(self._metadata_ready)
+        self.gpu_loader = LatestTask(self)
+        self.gpu_loader.ready.connect(self._gpu_ready)
+        self.gpu_loader.failed.connect(lambda error: self.memory_estimate.set_gpu(None, error))
+        self._gpu_index = None
         self.fullscreen_preview: FullscreenPreview | None = None
         self._fullscreen_hint_seen = False
         self.destination = output_dir()
@@ -112,6 +120,7 @@ class StudioWindow(QMainWindow):
         self._build()
         self.setStyleSheet(STYLE)
         self.apply_settings(HdrSettings())
+        self.device.changed.connect(self._request_gpu)
         if QApplication.platformName() == "windows":
             QTimer.singleShot(0, self.preview_device.ensure)
         for shortcut, action in (
@@ -156,11 +165,18 @@ class StudioWindow(QMainWindow):
         self.clear_button = self.button("Clear queue", self.clear_files, left)
         body.addLayout(left)
         center = QVBoxLayout()
+        header = QHBoxLayout()
+        details = QVBoxLayout()
         self.image_title = QLabel("No image")
-        center.addWidget(self.image_title)
+        self.image_title.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        details.addWidget(self.image_title)
         self.image_info = QLabel()
         self.image_info.setWordWrap(True)
-        center.addWidget(self.image_info)
+        details.addWidget(self.image_info)
+        header.addLayout(details, 1)
+        self.memory_estimate = MemoryEstimate()
+        header.addWidget(self.memory_estimate, 0, Qt.AlignmentFlag.AlignTop)
+        center.addLayout(header)
         self.canvas = CompareCanvas(device=self.preview_device)
         self.canvas.fullscreen_requested.connect(self.show_fullscreen_preview)
         center.addWidget(self.canvas, 1)
@@ -344,6 +360,23 @@ class StudioWindow(QMainWindow):
         )
         self._applying = False
         self.update_notice()
+        self._request_gpu()
+
+    def _request_gpu(self):
+        device = self.device.value()
+        if device != self._gpu_index:
+            self._gpu_index = device
+            self.memory_estimate.set_gpu(None)
+            self.gpu_loader.submit(gpu_capacity, device)
+
+    def _gpu_ready(self, result):
+        if result["device"] == self.device.value():
+            self.memory_estimate.set_gpu(result)
+
+    def _metadata_ready(self, result):
+        source, info = result
+        if source == self.selected_file():
+            self.memory_estimate.set_image(info)
 
     def choose_preset(self, name):
         if not self._applying and name in PRESETS:
@@ -384,6 +417,10 @@ class StudioWindow(QMainWindow):
         self.set_busy(False)
 
     def clear_files(self):
+        if self.job:
+            return
+        self.metadata_loader.cancel()
+        self.memory_estimate.set_image(None)
         self.preview_loader.cancel()
         self.loading_preview = False
         self._displayed_source = None
@@ -401,7 +438,11 @@ class StudioWindow(QMainWindow):
     def select_file(self, _index):
         source = self.selected_file()
         if not source:
+            self.memory_estimate.set_image(None)
             return
+        result = self.results.get(source)
+        self.memory_estimate.set_image(result["info"] if result else None)
+        self.metadata_loader.submit(source_info, source)
         if self._displayed_source != source:
             self.canvas.set_images(QPixmap())
         self.loading_preview = True
@@ -554,6 +595,8 @@ class StudioWindow(QMainWindow):
             self.start_job("export", self.files.copy())
 
     def start_job(self, mode, files):
+        if self.job or not files:
+            return
         request = {
             "mode": mode,
             "files": files,
@@ -726,6 +769,8 @@ class StudioWindow(QMainWindow):
                 return
         self._closing = True
         self.preview_loader.close()
+        self.metadata_loader.close()
+        self.gpu_loader.close()
         if self.fullscreen_preview is not None:
             self.fullscreen_preview.close()
         self.canvas.shutdown()

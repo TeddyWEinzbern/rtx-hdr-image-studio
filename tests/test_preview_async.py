@@ -126,6 +126,24 @@ def test_processing_locks_only_its_image_and_closes_only_its_fullscreen(images_w
     assert window.view_buttons["split"].isChecked()
 
 
+def test_focus_estimate_and_duplicate_job_guard(images_window, wait_until):
+    from rtx_hdr_studio.resources import GiB, estimate_gpu_bytes
+
+    window, (first, second, _) = images_window
+    Image.new("RGB", (416, 240), "blue").save(second)
+    window.gpu_loader.cancel()
+    window.memory_estimate.set_gpu({"device": 0, "name": "Test GPU", "total": 8 * GiB})
+    window.start_job("preview", [first])
+    runner = window.job
+    window.start_job("export", [second])
+    assert window.job is runner and runner.request["files"] == [first]
+    window.queue.setCurrentRow(1)
+    wait_until(lambda: window.memory_estimate.info and window.memory_estimate.info["width"] == 416)
+    assert window.processing_source == first
+    assert window.memory_estimate.bar.estimate == estimate_gpu_bytes(416, 240)
+    assert window.memory_estimate.bar.capacity == 8 * GiB
+
+
 def test_completed_preview_switches_to_split_after_loading(images_window, wait_until):
     window, (first, _, _) = images_window
     window.start_job("preview", [first])

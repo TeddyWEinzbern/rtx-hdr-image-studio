@@ -1,6 +1,7 @@
 """Qt worker lifecycle and cancellation; GPU work lives in a separate process."""
 
 import json
+import shutil
 import subprocess
 import sys
 import threading
@@ -78,5 +79,11 @@ class JobRunner(QThread):
             if self._process is not None and self._process.poll() is None:
                 self._process.terminate()
                 self._process.wait()
+            # Terminated workers cannot run their mapping cleanup. This job's
+            # unique directory is owned by the runner; leave completed caches.
+            directory = Path(self.request["job_dir"])
+            for scratch in directory.glob("image-*"):
+                if scratch.is_dir() and not scratch.is_symlink():
+                    shutil.rmtree(scratch, ignore_errors=True)
             if self._cancelled.is_set():
                 self.outcome = {"cancelled": True}

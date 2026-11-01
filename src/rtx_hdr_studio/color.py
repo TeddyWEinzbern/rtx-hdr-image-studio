@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import numpy as np
 
+from .resources import strip_rows
+
 BT2020_TO_709 = np.array(
     [
         [1.6604910021, -0.5876411388, -0.0728498633],
@@ -57,10 +59,19 @@ def sdr_preview(scrgb: np.ndarray, peak_nits: float = 650) -> np.ndarray:
 
 
 def hdr_statistics(scrgb: np.ndarray) -> dict:
-    luminance = np.maximum(scrgb @ LUMA_709, 0) * 80
+    peak, total, negative, above = 0.0, 0.0, 0, 0
+    rows = strip_rows(scrgb.shape[1])
+    for y in range(0, scrgb.shape[0], rows):
+        pixels = scrgb[y : y + rows]
+        luminance = np.maximum(pixels @ LUMA_709, 0) * 80
+        peak = max(peak, float(luminance.max()))
+        total += float(luminance.sum(dtype=np.float64))
+        negative += int(np.count_nonzero(pixels < 0))
+        above += int(np.count_nonzero(luminance > 203))
+    count = scrgb.shape[0] * scrgb.shape[1]
     return {
-        "peak_luminance_nits": round(float(luminance.max()), 3),
-        "average_luminance_nits": round(float(luminance.mean()), 3),
-        "negative_channel_fraction": round(float(np.mean(scrgb < 0)), 6),
-        "above_sdr_white_fraction": round(float(np.mean(luminance > 203)), 6),
+        "peak_luminance_nits": round(peak, 3),
+        "average_luminance_nits": round(total / count, 3),
+        "negative_channel_fraction": round(negative / (count * 3), 6),
+        "above_sdr_white_fraction": round(above / count, 6),
     }

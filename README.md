@@ -8,7 +8,6 @@ Created with **OpenAI Codex (ChatGPT)** under the direction of **TeddyWEinzbern*
 
 ## Features
 
-- English GUI with drag-and-drop, batch processing, presets, and cancellation.
 - Peak luminance, contrast, saturation, middle gray, debanding, exposure, and GPU selection.
 - Native Direct3D 11 FP16/scRGB HDR preview, split comparison, SDR tone-mapped fallback, and full-screen viewing.
 - EXIF orientation and embedded ICC input conversion to sRGB; explicit alpha compositing.
@@ -62,43 +61,14 @@ Use PowerShell for the commands below.
 
 Dependencies are declared in [pyproject.toml](pyproject.toml). Install `.[gpu]` for GPU processing or `.` for the interface and CPU-testable components. Install only one CuPy distribution in an environment.
 
-## Use
+## Usage limits
 
-1. Choose **Add images**, or drop PNG/JPEG/WebP/BMP/TIFF files into the window.
-2. Choose a preset or adjust the parameters. Built-in presets include **NVIDIA default**, **HDR400** (400 nit, middle gray 50), **HDR600** (640 nit, middle gray 80), **HDR1000** (1000 nit, middle gray 100), and **HDR1000 Highlight** (1000 nit, middle gray 80). The four HDR presets use contrast/saturation 100, exposure 0 EV, debanding enabled, standard sRGB input, black alpha compositing, and GPU index 0.
-3. Choose **Generate preview**. Drag the divider or choose Original/Processed.
-4. Leave **Automatic HDR** selected for native HDR, or select **SDR tone-mapped**.
-5. Choose **Export JXR** to export the queue with the current settings.
-
-Parameter changes do not automatically re-run inference; an outdated preview is labeled. Preview caches fit within **3840 × 2160 pixels**: exceeding either width or height scales both dimensions proportionally, without upscaling smaller images. Inference and export preserve the source dimensions. Generate a new preview to replace any older, smaller cache.
-
-Preview image decoding, HDR data preparation, frame resizing, and Direct3D device initialization run in the background. The window shows **Preparing preview** or **Preparing HDR preview** while those tasks finish; the rendering device is reused across previews and full-screen views. Rapid image changes discard outdated loading results.
-
-While an image is being processed, its view returns to **Original**, any full-screen view of that image closes, and its preview-mode and Fullscreen buttons are disabled. Double-click cannot reopen it until processing finishes. The image queue stays available: other unprocessed and previously processed images retain their usual viewing controls. For a batch, the restriction follows the file currently being processed and is released on completion, failure, or cancellation. Successfully completed images automatically open in **Split view** once their new preview loads. If another image is selected, its view stays unchanged; the completed image opens in Split view when next selected.
-
-Choose the blue **Fullscreen** button below the preview, or double-click the image, to view it on its display. The image and comparison mode are fixed until you exit. In Split view, hold the left mouse button on the image and drag horizontally to adjust the divider; its position stays within the displayed image in all scaling modes. This adjustment applies to the current full-screen view. A centered exit hint disappears after three seconds. Once it disappears automatically, it stays hidden on subsequent entries for the rest of the current application run. Exiting before the three seconds have elapsed leaves the hint available for the next entry. Restarting the application resets it; no preference is saved. Mouse activity never restores the hint. Double-click the image or press **Esc** to return. Switching away from the application also closes the full-screen preview. **Processed** and **Split view** remain disabled until the selected image has a generated preview; **Original** and full-screen viewing are available as soon as the source image is loaded.
-
-The active preview mode is highlighted on its button. The three mode buttons stay grouped on the left in **Original / Processed / Split view** order; Fullscreen and its scaling selector stay on the right without stretching across a wide window. Choose **Keep aspect ratio** (default) to fit the screen, **Fill** to keep the aspect ratio and crop centrally to cover the screen, **Stretch** to fill it without preserving the aspect ratio, or **No scaling** for one preview pixel per physical display pixel, centered on screen. No scaling automatically fits while keeping aspect ratio if either image dimension exceeds the screen. Dropdowns and the image queue use light selection highlights on dark backgrounds.
-
-Dropdown menus share the control's rounded border, font, width, and row height. They open below the control when there is enough space, otherwise above it or with a shorter scrollable list. Their final position is calculated before display, without a native opening animation that could move them afterward. Arrow keys and Enter select an option; Esc or clicking outside dismisses the menu.
-
-Preview readiness and image peak appear together, for example **HDR Ready | Peak: 637nit**. Changing the parameters marks the existing preview **(Outdated)** and highlights the entire status in red; generating a matching preview clears the highlight. SDR viewing retains its SDR readiness/fallback label in the same status line.
-
-| Parameter | Range | Default |
-| --- | --- | --- |
-| Peak luminance | 400–2000 nit | 650 |
-| Contrast | 0–200 | 100 |
-| Saturation | 0–200 | 100 |
-| Middle gray | 10–100 | 50 |
-| Debanding | On/off | On |
-| Exposure | -3 to +3 EV | 0 |
-| Input transfer | sRGB / gamma 2.2 | sRGB |
-| Alpha background | Black / white | Black |
-| GPU index | 0–15 | 0 |
-
-For multiple GPUs, enter the CUDA device index. Target peak does not determine actual display brightness. Presets are JSON files. A `.settings.json` sidecar records each export's processing parameters, source path, color profile description, GPU, and statistics.
-
-Shortcuts: **Ctrl+O** adds images, **Ctrl+R** generates a preview, and **Ctrl+E** exports the queue. Repeated filenames gain a numeric suffix. Cancel stops the worker and keeps completed files.
+- SDR PNG, JPEG, WebP, BMP, and TIFF inputs are limited to **943.72 megapixels** (width × height ≤ 943,718,400 pixels; 30720 × 30720 at the limit). This is an application limit, not a guarantee that every size or aspect ratio can be processed. Codec limits and available GPU memory, RAM, commit headroom, and scratch disk space also apply; larger images are rejected rather than downscaled.
+- Processing is serial, including across application instances in the same Windows session. Large CPU buffers use temporary files in the cache; interruption removes the active job's scratch files after the worker stops. Very large sources can require tens of GiB of RAM and scratch storage, and may be slow to decode or export.
+- The upper-right GPU memory estimate applies only to the focused image. Its fixed scale is the selected GPU's dedicated VRAM capacity. Demand above capacity is expected to use shared system memory; the estimate is approximate and does not guarantee successful allocation. Extreme shapes, other GPUs/SDK versions, and other applications can change actual usage.
+- Parameter changes do not regenerate the preview automatically. An outdated preview shows the previous result; exports use the current settings.
+- Preview caches fit within **3840 × 2160 pixels**, preserving aspect ratio without upscaling. Inference and export retain the source dimensions.
+- Existing exports are never overwritten; filename collisions receive a numeric suffix. Cancellation keeps completed exports.
 
 ## Color pipeline and limitations
 
@@ -109,11 +79,14 @@ Input ICC profile → sRGB RGB8 → linear-light exposure → Rec.709/gamma 2.2 
 - Windows HDR wallpaper rendering varies. In testing, a 5120×2880 JXR appeared gray while a 2560×1600 version displayed correctly; matching the image to the display resolution may help.
 - Viewers, wallpaper paths, and screenshots may tone-map or lose HDR even when the exported JXR validates correctly.
 - Display output depends on the panel, calibration, Windows color management, and drivers. The application does not alter system display settings.
+- Target peak luminance is a processing parameter, not a guarantee of actual image or display brightness.
 - Processing is local; the application contains no upload or telemetry code.
 
 ## Files and logs
 
 Default exports: `Pictures\RTX HDR Image Studio` under the current user's home directory. Choose another output directory in the UI.
+
+A `.settings.json` sidecar records each export's processing parameters, source path, color profile description, GPU, and statistics.
 
 Logs and preview caches are stored in `%LOCALAPPDATA%\RTX HDR Image Studio\cache` and may contain source filenames and paths. Set `RTX_HDR_STUDIO_HOME` to use another location, and review logs before sharing them.
 

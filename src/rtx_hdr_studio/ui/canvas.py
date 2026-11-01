@@ -8,7 +8,7 @@ from PySide6.QtWidgets import QApplication, QSizePolicy, QWidget
 
 from ..graphics.display import DisplayInfo, query_display
 from .geometry import image_placement
-from .preview_tasks import PreviewDevice
+from .preview_tasks import LatestTask, PreviewDevice, prepare_sdr_frames
 
 
 class CompareCanvas(QWidget):
@@ -21,6 +21,12 @@ class CompareCanvas(QWidget):
         self.preview_device = device if device is not None else PreviewDevice(self)
         self.before = QPixmap()
         self.after = QPixmap()
+        self.sdr_task = LatestTask(self)
+        self.sdr_task.ready.connect(self._sdr_ready)
+        self.sdr_task.failed.connect(self._sdr_failed)
+        self._sdr_key = None
+        self._sdr_prepared = None
+        self._sdr_sources = (None, None)
         self.split = 0.5
         self.mode = "split"
         self.show_split_handle = True
@@ -52,6 +58,9 @@ class CompareCanvas(QWidget):
         self._disable_hdr()
         self.before = before
         self.after = after or QPixmap()
+        self.sdr_task.cancel()
+        self._sdr_key = self._sdr_prepared = None
+        self._sdr_sources = (self.before.toImage(), self.after.toImage())
         self.hdr_path = hdr_path
         self.hdr_data = hdr_data
         self.hdr_error = ""
@@ -70,6 +79,7 @@ class CompareCanvas(QWidget):
         self.refresh_display()
 
     def shutdown(self):
+        self.sdr_task.close()
         self.display_timer.stop()
         self.hdr_active = False
         self.hdr_loading = False
@@ -148,6 +158,42 @@ class CompareCanvas(QWidget):
         if self.hdr_surface:
             self.hdr_surface.setGeometry(self.rect())
 
+    def _request_sdr_frame(self):
+        if self.before.isNull() or self.hdr_active:
+            return
+        ratio = self.devicePixelRatioF()
+        width, height = round(self.width() * ratio), round(self.height() * ratio)
+        margin = round(self.image_margin * ratio)
+        key = (
+            self.before.cacheKey(),
+            self.after.cacheKey(),
+            width,
+            height,
+            self.scale_mode,
+            margin,
+        )
+        if key == self._sdr_key:
+            return
+        self._sdr_key, self._sdr_prepared = key, None
+        self.sdr_task.submit(
+            prepare_sdr_frames, *self._sdr_sources, width, height, self.scale_mode, margin
+        )
+
+    def _sdr_ready(self, prepared):
+        x, y, width, height, before, after = prepared
+        self._sdr_prepared = (
+            x,
+            y,
+            width,
+            height,
+            QPixmap.fromImage(before),
+            QPixmap.fromImage(after),
+        )
+        self.update()
+
+    def _sdr_failed(self, message):
+        logging.getLogger(__name__).warning("SDR resampling failed: %s", message)
+
     def showEvent(self, event):
         super().showEvent(event)
         QTimer.singleShot(0, self.refresh_display)
@@ -192,6 +238,7 @@ class CompareCanvas(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         painter.fillRect(self.rect(), QColor("#10151b"))
         if self.before.isNull():
             painter.setPen(QColor("#d6dde7"))
@@ -202,16 +249,24 @@ class CompareCanvas(QWidget):
                 "Drop images here",
             )
             return
+        if self.hdr_active:
+            return  # The native child surface owns the visible pixels.
+        self._request_sdr_frame()
         image_rect = self.image_rect()
+        before, after = self.before, self.after
+        if self._sdr_prepared is not None:
+            x, y, width, height, before, after = self._sdr_prepared
+            ratio = self.devicePixelRatioF()
+            image_rect = QRectF(x / ratio, y / ratio, width / ratio, height / ratio)
         if self.mode == "after" and not self.after.isNull():
-            painter.drawPixmap(image_rect, self.after, QRectF(self.after.rect()))
+            painter.drawPixmap(image_rect, after, QRectF(after.rect()))
         else:
-            painter.drawPixmap(image_rect, self.before, QRectF(self.before.rect()))
+            painter.drawPixmap(image_rect, before, QRectF(before.rect()))
             if self.mode == "split" and not self.after.isNull():
                 boundary = self.width() * self.split
                 painter.save()
                 painter.setClipRect(QRectF(boundary, 0, self.width() - boundary, self.height()))
-                painter.drawPixmap(image_rect, self.after, QRectF(self.after.rect()))
+                painter.drawPixmap(image_rect, after, QRectF(after.rect()))
                 painter.restore()
                 painter.setPen(QPen(QColor("#d1ebd7"), 1))
                 painter.drawLine(

@@ -5,16 +5,21 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 import numpy as np
-from PIL import Image
 from PySide6.QtCore import QObject, Signal
 from PySide6.QtGui import QImage
 
 from ..color import srgb_to_linear
-from ..image_io import load_image, preview_size, resize_linear
+from ..image_io import image_info, load_image, resize_linear
+from ..resources import ScratchSpace
 from .geometry import image_placement
 
 CPU_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="preview")
 DEVICE_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="hdr-device")
+IMAGE_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="image-decode")
+
+
+def source_info(source):
+    return source, image_info(source)
 
 
 class LatestTask(QObject):
@@ -97,14 +102,10 @@ def load_preview(source, result, background):
         if before.isNull() or after.isNull():
             raise ValueError("Preview cache is unavailable. Generate the preview again.")
         return LoadedPreview(source, before, after, result["hdr_preview"], result["info"])
-    rgb, info = load_image(source, background)
-    image = Image.fromarray(rgb)
-    size = preview_size(*image.size)
-    if size != image.size:
-        image = image.resize(size, Image.Resampling.LANCZOS)
-    rgb = np.asarray(image)
-    height, width = rgb.shape[:2]
-    before = QImage(rgb.data, width, height, width * 3, QImage.Format.Format_RGB888).copy()
+    with ScratchSpace():
+        rgb, info = load_image(source, background, preview=True)
+        height, width = rgb.shape[:2]
+        before = QImage(rgb.data, width, height, width * 3, QImage.Format.Format_RGB888).copy()
     return LoadedPreview(source, before, QImage(), None, info)
 
 
@@ -125,6 +126,39 @@ def load_hdr(image, path):
     ):
         raise ValueError("Invalid HDR preview cache. Generate the preview again.")
     return image_to_linear(image), data
+
+
+def prepare_sdr_frames(before, after, width, height, mode, margin):
+    """Filter at the final physical display size; no QPixmap/GUI work here."""
+    h, w = before.height(), before.width()
+    x, y, iw, ih = image_placement(w, h, width, height, mode, margin)
+    left, top = max(0, x), max(0, y)
+    right, bottom = min(width, x + iw), min(height, y + ih)
+    box = None
+    if (left, top, right, bottom) != (x, y, x + iw, y + ih):
+        box = ((left - x) * w / iw, (top - y) * h / ih, (right - x) * w / iw, (bottom - y) * h / ih)
+    images = []
+    for image in (before, after):
+        if image.isNull():
+            images.append(QImage())
+            continue
+        image = image.convertToFormat(QImage.Format.Format_RGB888)
+        pixels = np.frombuffer(image.constBits(), np.uint8).reshape(
+            image.height(), image.bytesPerLine()
+        )
+        pixels = pixels[:, : image.width() * 3].reshape(image.height(), image.width(), 3)
+        scaled = resize_linear(pixels, right - left, bottom - top, box=box)
+        rgb = np.clip(np.rint(scaled), 0, 255).astype(np.uint8)
+        images.append(
+            QImage(
+                rgb.data,
+                right - left,
+                bottom - top,
+                (right - left) * 3,
+                QImage.Format.Format_RGB888,
+            ).copy()
+        )
+    return left, top, right - left, bottom - top, *images
 
 
 def prepare_frames(before_linear, after_linear, width, height, white, mode, margin):

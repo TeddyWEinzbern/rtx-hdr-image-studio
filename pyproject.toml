@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rtx-hdr-image-studio"
-version = "1.1.2"
+version = "1.2.0"
 description = "A local Windows GUI for NVIDIA TrueHDR image processing and FP16 scRGB JPEG XR export."
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
