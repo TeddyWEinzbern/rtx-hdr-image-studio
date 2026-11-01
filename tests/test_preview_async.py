@@ -9,6 +9,7 @@ from PySide6.QtGui import QImage
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
+from rtx_hdr_studio.graphics.display import DisplayInfo
 from rtx_hdr_studio.ui import window as window_module
 from rtx_hdr_studio.ui.preview_tasks import (
     LatestTask,
@@ -175,6 +176,39 @@ def test_file_failure_releases_its_viewing_restriction(images_window):
     assert window.canvas.mode == "before"
     assert all(button.isEnabled() for button in window.view_buttons.values())
     assert window.fullscreen_button.isEnabled()
+
+
+def test_status_merges_peak_and_outdated_highlight_then_clears_on_image_change(
+    images_window, wait_until
+):
+    from PySide6.QtGui import QPalette
+
+    window, (first, _, _) = images_window
+    window.canvas.display_info = DisplayInfo(hdr_active=True, bits=10)
+    window.canvas.hdr_active = True
+    window.update_notice()
+    assert window.display_status.text() == "HDR Ready | Peak: 650nit"
+    original_color = window.display_status.palette().color(QPalette.WindowText)
+    window.parameters["contrast"].set_value(105)
+    assert window.display_status.text() == "HDR Ready | Peak: 650nit (Outdated)"
+    assert window.display_status.palette().color(QPalette.WindowText).name() == "#ff6b6b"
+    window.parameters["contrast"].set_value(100)
+    assert window.display_status.text() == "HDR Ready | Peak: 650nit"
+    assert window.display_status.palette().color(QPalette.WindowText) == original_color
+    window.parameters["contrast"].set_value(105)
+    window.results[first]["settings"] = window.current_settings().to_dict()
+    window.results[first]["statistics"]["peak_luminance_nits"] = 637
+    window.update_notice()
+    assert window.display_status.text() == "HDR Ready | Peak: 637nit"
+    assert window.display_status.palette().color(QPalette.WindowText) == original_color
+    window.canvas.hdr_active = False
+    window.canvas.prefer_hdr = False
+    window.update_notice()
+    assert window.display_status.text() == "SDR Ready | Peak: 637nit"
+    window.queue.setCurrentRow(1)
+    wait_until(lambda: not window.loading_preview)
+    assert window.display_status.text() == "SDR Ready"
+    assert window.display_status.styleSheet() == ""
 
 
 def test_preview_loader_drops_old_image_without_blocking_gui(

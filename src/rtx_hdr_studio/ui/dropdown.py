@@ -3,6 +3,7 @@
 from PySide6.QtCore import QPoint, QRect, QRectF, Qt
 from PySide6.QtGui import QFontMetrics, QGuiApplication, QPainterPath, QRegion
 from PySide6.QtWidgets import (
+    QApplication,
     QComboBox,
     QFrame,
     QListView,
@@ -13,7 +14,7 @@ from PySide6.QtWidgets import (
 
 
 def popup_geometry(anchor, available, preferred_height, gap=3):
-    """Align with the control; flip above it or scroll when screen space is limited."""
+    """Choose a final below/above position, fitting the available screen if necessary."""
     width = min(anchor.width(), available.width())
     below_y = anchor.bottom() + 1 + gap
     below = max(0, available.bottom() - below_y + 1)
@@ -74,16 +75,27 @@ class Dropdown(QComboBox):
             return
         self.view().setFont(self.font())
         self.view().doItemsLayout()
-        super().showPopup()
-        popup = self.view().window()
-        popup.setFrameShape(QFrame.Shape.NoFrame)
-        popup.layout().setContentsMargins(0, 0, 0, 0)
         anchor = QRect(self.mapToGlobal(QPoint()), self.size())
         screen = QGuiApplication.screenAt(anchor.center()) or self.screen()
         height = min(self.count(), self.maxVisibleItems()) * self.height() + 10
-        popup.setGeometry(popup_geometry(anchor, screen.availableGeometry(), height))
-        self.view().doItemsLayout()
-        self.view().scrollTo(self.view().currentIndex())
-        outline = QPainterPath()
-        outline.addRoundedRect(QRectF(popup.rect()), 5, 5)
-        popup.setMask(QRegion(outline.toFillPolygon().toPolygon()))
+        geometry = popup_geometry(anchor, screen.availableGeometry(), height)
+        popup = self.view().window()
+        animate = QApplication.isEffectEnabled(Qt.UIEffect.UI_AnimateCombo)
+        updates = popup.updatesEnabled()
+        popup.setUpdatesEnabled(False)
+        # Qt's scroll animation remembers its original, screen-constrained
+        # geometry. Skip it while establishing our fixed position.
+        QApplication.setEffectEnabled(Qt.UIEffect.UI_AnimateCombo, False)
+        try:
+            super().showPopup()
+            popup.setFrameShape(QFrame.Shape.NoFrame)
+            popup.layout().setContentsMargins(0, 0, 0, 0)
+            popup.setGeometry(geometry)
+            self.view().doItemsLayout()
+            self.view().scrollTo(self.view().currentIndex())
+            outline = QPainterPath()
+            outline.addRoundedRect(QRectF(popup.rect()), 5, 5)
+            popup.setMask(QRegion(outline.toFillPolygon().toPolygon()))
+        finally:
+            QApplication.setEffectEnabled(Qt.UIEffect.UI_AnimateCombo, animate)
+            popup.setUpdatesEnabled(updates)

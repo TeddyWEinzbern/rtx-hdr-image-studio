@@ -2,8 +2,6 @@
 
 A local Windows desktop application that applies NVIDIA TrueHDR to SDR still images, previews the result in native HDR, and exports verified FP16 linear scRGB JPEG XR (`.jxr`) files.
 
-Current source version: **1.1.1**. See [CHANGELOG.md](CHANGELOG.md) for changes.
-
 Created with **OpenAI Codex (ChatGPT)** under the direction of **TeddyWEinzbern**. This is an independent community project. See [AUTHORS.md](AUTHORS.md).
 
 ![English interface with a synthetic gradient in SDR Split view](docs/interface.png)
@@ -82,7 +80,9 @@ Choose the blue **Fullscreen** button below the preview, or double-click the ima
 
 The active preview mode is highlighted on its button. The three mode buttons stay grouped on the left in **Original / Processed / Split view** order; Fullscreen and its scaling selector stay on the right without stretching across a wide window. Choose **Keep aspect ratio** (default) to fit the screen, **Fill** to keep the aspect ratio and crop centrally to cover the screen, **Stretch** to fill it without preserving the aspect ratio, or **No scaling** for one preview pixel per physical display pixel, centered on screen. No scaling automatically fits while keeping aspect ratio if either image dimension exceeds the screen. Dropdowns and the image queue use light selection highlights on dark backgrounds.
 
-Dropdown menus share the control's rounded border, font, width, and row height. They align below the control, open above it near the screen bottom, and scroll when needed. Arrow keys and Enter select an option; Esc or clicking outside dismisses the menu.
+Dropdown menus share the control's rounded border, font, width, and row height. They open below the control when there is enough space, otherwise above it or with a shorter scrollable list. Their final position is calculated before display, without a native opening animation that could move them afterward. Arrow keys and Enter select an option; Esc or clicking outside dismisses the menu.
+
+Preview readiness and image peak appear together, for example **HDR Ready | Peak: 637nit**. Changing the parameters marks the existing preview **(Outdated)** and highlights the entire status in red; generating a matching preview clears the highlight. SDR viewing retains its SDR readiness/fallback label in the same status line.
 
 | Parameter | Range | Default |
 | --- | --- | --- |
@@ -119,7 +119,7 @@ Logs and preview caches are stored in `%LOCALAPPDATA%\RTX HDR Image Studio\cache
 
 ## Development
 
-See [CONTRIBUTING.md](CONTRIBUTING.md), [architecture](docs/architecture.md), and [testing](docs/testing.md).
+See [CONTRIBUTING.md](CONTRIBUTING.md), [CHANGELOG.md](CHANGELOG.md), [architecture](docs/architecture.md), and [testing](docs/testing.md).
 
 ## License and attribution
 

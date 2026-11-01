@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.2 - 2026-11-01
+
+- Calculate the dropdown's final position before display, retaining screen-space checks for opening above or below and shortening long lists. Skip the native opening animation to prevent it from moving the popup back to a previous position.
+- Merge readiness, image peak, and outdated-preview status into one line. Outdated previews retain their peak reading, append `(Outdated)`, and highlight the full status in red.
+- Remove the separate peak panel, refresh the synthetic README screenshot, and remove the README's current-source-version paragraph.
+
 ## 1.1.1 - 2026-11-01
 
 - Show the full-screen exit hint until it has disappeared automatically once per application run. Early exit keeps the hint available; restarting resets it without saving a preference.

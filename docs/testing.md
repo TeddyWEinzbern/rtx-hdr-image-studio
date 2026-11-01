@@ -1,5 +1,17 @@
 # Testing and evidence
 
+## Version 1.1.2 validation (2026-11-01)
+
+| Check | Result |
+| --- | --- |
+| CPU/UI suite with the offscreen platform | 103 passed |
+| Dropdown interaction and geometry on the Windows platform | 12 passed |
+| Native Direct3D buffer and full-screen HDR viewing | 2 passed |
+| Real NVIDIA worker preview and JXR export | 1 passed |
+| Ruff lint, formatting, and package builds | Passed |
+
+Dropdown regression checks confirm that the popup stays at its final position immediately after opening and after the native animation interval, both below the control and above it near the screen bottom. Available-screen-space checks remain enabled. Status tests check the merged readiness/peak text, red outdated highlighting, matching-result recovery, and switching to an image without a preview. The README screenshot uses synthetic SDR data; it does not establish physical HDR appearance.
+
 ## Version 1.1.1 validation (2026-11-01)
 
 | Check | Result |
@@ -45,7 +57,7 @@ The buffer test creates its own small Windows surface and reads back its own GPU
 
 ## Manual checks before release
 
-Open every dropdown at 100%, 150%, and 200% display scaling. Its popup must match the control's width and left edge, rounded border, font, and row height. Check first and last selections: the popup must stay anchored below the control, flip above near the screen bottom, and scroll if neither side has enough space. Check arrow keys/Enter, mouse selection, Esc cancellation, outside-click dismissal, reopening, and secondary displays. The dropdown arrow must be included in installed packages and remain visible without an SVG plugin.
+Open every dropdown at 100%, 150%, and 200% display scaling. Its popup must match the control's width and left edge, rounded border, font, and row height. Check first and last selections: the popup must open at its final calculated position below or above the control, staying inside the available screen. It must not jump after opening or after an animation delay. Long lists must scroll. Check arrow keys/Enter, mouse selection, Esc cancellation, outside-click dismissal, reopening, and secondary displays. The dropdown arrow must be included in installed packages and remain visible without an SVG plugin. Preview status must combine readiness and image peak; a parameter change must keep the peak visible, append (Outdated), and color the full status red. Regenerating with matching settings or selecting an image without a preview must clear the outdated highlight.
 
 Generate a large preview and monitor the GUI while PNG/HDR data and the initial D3D device are prepared: window movement, cancel, and closing must remain responsive. Rapidly select different images and resize/full-screen/close during preparation; old results must not overwrite the current image or reopen a closed surface. In a batch, verify that only the currently processed image loses mode/full-screen controls, that a matching full-screen view closes, and that the lock advances and clears on failure/cancellation. Include initial HDR startup, repeated regeneration, SDR fallback, and a near-40MP source. Record event-loop latency separately from total time until the HDR frame is ready.
 

@@ -74,7 +74,6 @@ QComboBox QAbstractItemView::item { padding: 0 6px; border-radius: 3px; }
 QComboBox QAbstractItemView::item:selected { background: #8bd89a; color: #12251a; }
 QLabel#title { font-size: 24px; font-weight: 600; }
 QLabel#muted { color: #a6b1c1; }
-QLabel#notice { background: #202935; padding: 10px; border-radius: 6px; }
 QListWidget::item { padding: 10px; border-radius: 5px; }
 QListWidget::item:selected { background: #8bd89a; color: #12251a; }
 QSlider::groove:horizontal { height: 4px; background: #3b4655; }
@@ -223,10 +222,6 @@ class StudioWindow(QMainWindow):
         preview_controls.addLayout(fullscreen_controls)
         preview_controls.setAlignment(fullscreen_controls, Qt.AlignmentFlag.AlignTop)
         center.addLayout(preview_controls)
-        self.notice = QLabel()
-        self.notice.setObjectName("notice")
-        self.notice.setWordWrap(True)
-        center.addWidget(self.notice)
         self.canvas.display_changed.connect(self.update_notice)
         body.addLayout(center, 1)
         self.settings_panel = QScrollArea()
@@ -525,30 +520,28 @@ class StudioWindow(QMainWindow):
         self._sync_view_buttons()
         display = canvas.display_info
         if self.loading_preview:
-            self.display_status.setText("Preparing preview...")
+            status = "Preparing preview..."
         elif canvas.hdr_loading:
-            self.display_status.setText("Preparing HDR preview...")
-        elif canvas.hdr_active:
-            self.display_status.setText(f"HDR | {display.bits}-bit")
+            status = "Preparing HDR preview..."
         elif canvas.hdr_error:
-            self.display_status.setText("SDR fallback")
-        elif not canvas.prefer_hdr:
-            self.display_status.setText("SDR preview")
-        elif display.hdr_active:
-            self.display_status.setText("HDR Ready")
+            status = "SDR fallback"
+        elif canvas.hdr_active or (canvas.prefer_hdr and display.hdr_active):
+            status = "HDR Ready"
         else:
-            self.display_status.setText("SDR preview")
-        note = ""
+            status = "SDR Ready"
         result = self.results.get(self.selected_file())
+        outdated = False
         if result:
-            if result["settings"] != self.current_settings().to_dict():
-                note = "Preview outdated"
-            else:
-                note = f"Peak: {result['statistics']['peak_luminance_nits']:.0f} nit"
-        self.notice.setText(note)
-        self.notice.setVisible(bool(note))
+            status += f" | Peak: {result['statistics']['peak_luminance_nits']:.0f}nit"
+            outdated = result["settings"] != self.current_settings().to_dict()
+            if outdated:
+                status += " (Outdated)"
+        self.display_status.setText(status)
+        color = "color: #ff6b6b;" if outdated else ""
+        if self.display_status.styleSheet() != color:
+            self.display_status.setStyleSheet(color)
         self.display_status.setToolTip(
-            f"{display.name}\nMode: {display.color_mode}\n"
+            f"{display.name}\nMode: {display.color_mode} | {display.bits}-bit\n"
             f"SDR white: {display.sdr_white_nits:.0f} nit\n{canvas.hdr_error or display.error}"
         )
 

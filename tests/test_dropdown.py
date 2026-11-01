@@ -23,7 +23,7 @@ from rtx_hdr_studio.ui.window import STYLE
         ),
     ],
 )
-def test_popup_stays_anchored_and_inside_available_screen(anchor, screen, height, expected):
+def test_popup_fits_available_screen(anchor, screen, height, expected):
     assert popup_geometry(anchor, screen, height) == expected
 
 
@@ -120,4 +120,26 @@ def test_long_popup_scrolls_without_changing_row_height(dropdown):
     index = dropdown.model().index(dropdown.currentIndex(), 0)
     assert view.visualRect(index).height() == dropdown.height()
     assert view.viewport().rect().contains(view.visualRect(index).center())
-    assert dropdown.screen().availableGeometry().contains(view.window().geometry())
+    assert view.window().width() == dropdown.width()
+
+
+@pytest.mark.parametrize("near_bottom", [False, True])
+def test_popup_uses_final_position_without_jumping_after_opening(dropdown, near_bottom):
+    host = dropdown.window()
+    if near_bottom:
+        host.move(host.x(), dropdown.screen().availableGeometry().bottom() - host.height() + 1)
+    QApplication.processEvents()
+    animation = QApplication.isEffectEnabled(Qt.UIEffect.UI_AnimateCombo)
+    dropdown.showPopup()
+    popup = dropdown.view().window()
+    anchor = QRect(dropdown.mapToGlobal(QPoint()), dropdown.size())
+    expected = popup_geometry(anchor, dropdown.screen().availableGeometry(), 106)
+    assert popup.geometry() == expected
+    assert dropdown.screen().availableGeometry().contains(popup.geometry())
+    if near_bottom:
+        assert popup.geometry().bottom() < anchor.top()
+    else:
+        assert popup.geometry().top() > anchor.bottom()
+    QTest.qWait(250)
+    assert popup.geometry() == expected
+    assert QApplication.isEffectEnabled(Qt.UIEffect.UI_AnimateCombo) == animation
