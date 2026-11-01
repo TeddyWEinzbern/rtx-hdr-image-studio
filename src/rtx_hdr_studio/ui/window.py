@@ -4,13 +4,11 @@ import json
 import uuid
 from pathlib import Path
 
-import numpy as np
 from PySide6.QtCore import Qt, QTimer, QUrl
 from PySide6.QtGui import (
     QColor,
     QDesktopServices,
     QFont,
-    QImage,
     QKeySequence,
     QPalette,
     QPixmap,
@@ -18,6 +16,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QApplication,
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QFileDialog,
@@ -30,22 +29,28 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
+    QStyledItemDelegate,
     QVBoxLayout,
     QWidget,
 )
 
 from .. import __version__
-from ..image_io import SUPPORTED, load_image
+from ..image_io import SUPPORTED
 from ..runtime import cache_dir, output_dir
 from ..settings import HdrSettings
 from .canvas import CompareCanvas
 from .controls import Parameter
+from .fullscreen import FullscreenPreview
 from .jobs import JobRunner
+from .preview_tasks import LatestTask, PreviewDevice, load_preview
 
 PRESETS = {
     "NVIDIA default": HdrSettings(),
-    "Soft photo": HdrSettings(luminance=600, contrast=95, saturation=90, middle_gray=45),
-    "Bright highlights": HdrSettings(luminance=1000, contrast=115, saturation=110),
+    "HDR400": HdrSettings(luminance=400, middle_gray=50),
+    "HDR600": HdrSettings(luminance=640, middle_gray=80),
+    "HDR1000": HdrSettings(luminance=1000, middle_gray=100),
+    "HDR1000 Highlight": HdrSettings(luminance=1000, middle_gray=80),
 }
 STYLE = """
 QWidget { color: #e6eaf1; font-family: 'Segoe UI'; font-size: 13px; }
@@ -54,27 +59,27 @@ QScrollArea, QListWidget { background: #1c222b; border: 1px solid #333c49; borde
 QWidget#settings { background: #1c222b; }
 QPushButton { background: #2b3542; border: 1px solid #435064; border-radius: 6px; padding: 8px 12px; }
 QPushButton:hover { background: #3a495a; }
+QPushButton:checked { background: #8bd89a; color: #12251a; border-color: #b7e6c0; font-weight: 600; }
+QPushButton:checked:hover { background: #b7e6c0; color: #12251a; }
 QPushButton:disabled { color: #75808d; background: #202731; }
 QPushButton#primary { background: #8bd89a; color: #12251a; font-weight: 600; }
+QPushButton#fullscreen { background: #75b9e8; color: #102536; border-color: #92ceef; font-weight: 600; }
+QPushButton#fullscreen:hover { background: #9ad1f2; }
+QPushButton#fullscreen:disabled { color: #75808d; background: #202731; border-color: #435064; }
 QComboBox, QDoubleSpinBox, QLineEdit { background: #11171f; padding: 5px; border: 1px solid #46546a; border-radius: 5px; }
-QComboBox QAbstractItemView { background: #202a37; selection-background-color: #355c44; }
+QComboBox QAbstractItemView { background: #1c222b; color: #e6eaf1; selection-background-color: #8bd89a; selection-color: #12251a; outline: 0; }
+QComboBox QAbstractItemView::item:selected { background: #8bd89a; color: #12251a; }
 QLabel#title { font-size: 24px; font-weight: 600; }
 QLabel#muted { color: #a6b1c1; }
 QLabel#notice { background: #202935; padding: 10px; border-radius: 6px; }
 QListWidget::item { padding: 10px; border-radius: 5px; }
-QListWidget::item:selected { background: #355442; }
+QListWidget::item:selected { background: #8bd89a; color: #12251a; }
 QSlider::groove:horizontal { height: 4px; background: #3b4655; }
 QSlider::sub-page:horizontal { background: #8bd89a; }
 QSlider::handle:horizontal { background: #b7e6c0; width: 12px; margin: -5px 0; border-radius: 5px; }
 QProgressBar { background: #283241; border: none; height: 5px; }
 QProgressBar::chunk { background: #8bd89a; }
 """
-
-
-def pixmap(rgb: np.ndarray) -> QPixmap:
-    rgb = np.ascontiguousarray(rgb, dtype=np.uint8)
-    h, w = rgb.shape[:2]
-    return QPixmap.fromImage(QImage(rgb.data, w, h, w * 3, QImage.Format.Format_RGB888).copy())
 
 
 class StudioWindow(QMainWindow):
@@ -88,12 +93,26 @@ class StudioWindow(QMainWindow):
         self.results: dict[str, dict] = {}
         self.outputs: dict[str, str] = {}
         self.job: JobRunner | None = None
+        self.processing_source = None
+        self._split_on_load = set()
+        self.loading_preview = False
+        self._displayed_source = None
+        self._closing = False
+        self.preview_device = PreviewDevice(self)
+        self.preview_loader = LatestTask(self)
+        self.preview_loader.ready.connect(self._preview_loaded)
+        self.preview_loader.failed.connect(self._preview_failed)
+        self.fullscreen_preview: FullscreenPreview | None = None
         self.destination = output_dir()
         self.last_log: Path | None = None
         self._applying = False
         self._build()
+        for combo in self.findChildren(QComboBox):
+            combo.setItemDelegate(QStyledItemDelegate(combo))
         self.setStyleSheet(STYLE)
         self.apply_settings(HdrSettings())
+        if QApplication.platformName() == "windows":
+            QTimer.singleShot(0, self.preview_device.ensure)
         for shortcut, action in (
             ("Ctrl+O", self.choose_files),
             ("Ctrl+R", self.preview),
@@ -141,16 +160,49 @@ class StudioWindow(QMainWindow):
         self.image_info = QLabel("Original dimensions are preserved on export.")
         self.image_info.setWordWrap(True)
         center.addWidget(self.image_info)
-        self.canvas = CompareCanvas()
+        self.canvas = CompareCanvas(device=self.preview_device)
+        self.canvas.fullscreen_requested.connect(self.show_fullscreen_preview)
         center.addWidget(self.canvas, 1)
+        preview_controls = QHBoxLayout()
+        preview_views = QVBoxLayout()
         views = QHBoxLayout()
+        self.view_group = QButtonGroup(self)
+        self.view_buttons = {}
         for title, mode in (
-            ("Split comparison", "split"),
             ("Original", "before"),
             ("Processed", "after"),
+            ("Split comparison", "split"),
         ):
-            self.button(title, lambda checked=False, m=mode: self.set_view(m), views)
-        center.addLayout(views)
+            self.view_buttons[mode] = self.button(
+                title, lambda checked=False, m=mode: self.set_view(m), views
+            )
+            self.view_buttons[mode].setCheckable(True)
+            self.view_buttons[mode].setSizePolicy(
+                QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
+            )
+            self.view_group.addButton(self.view_buttons[mode])
+        views.addStretch()
+        preview_views.addLayout(views)
+        fullscreen_controls = QVBoxLayout()
+        self.fullscreen_button = self.button(
+            "Fullscreen", self.show_fullscreen_preview, fullscreen_controls
+        )
+        self.fullscreen_button.setObjectName("fullscreen")
+        self.fullscreen_button.setToolTip("View fullscreen, or double-click the image")
+        self.fullscreen_button.setFixedWidth(160)
+        self.fullscreen_scale = QComboBox()
+        self.fullscreen_scale.setAccessibleName("Fullscreen scaling mode")
+        self.fullscreen_scale.addItem("Keep aspect ratio", "fit")
+        self.fullscreen_scale.addItem("Fill", "fill")
+        self.fullscreen_scale.addItem("Stretch", "stretch")
+        self.fullscreen_scale.addItem("No scaling", "actual")
+        self.fullscreen_scale.setFixedWidth(160)
+        self.fullscreen_scale.setToolTip(
+            "Fill keeps the aspect ratio and crops centrally to fill the screen. "
+            "No scaling uses one preview pixel per physical screen pixel; "
+            "images larger than the screen fit while keeping their aspect ratio."
+        )
+        fullscreen_controls.addWidget(self.fullscreen_scale)
         display = QHBoxLayout()
         self.display_mode = QComboBox()
         self.display_mode.setAccessibleName("Preview display mode")
@@ -163,7 +215,11 @@ class StudioWindow(QMainWindow):
         self.display_status = QLabel()
         self.display_status.setWordWrap(True)
         display.addWidget(self.display_status, 1)
-        center.addLayout(display)
+        preview_views.addLayout(display)
+        preview_controls.addLayout(preview_views, 1)
+        preview_controls.addLayout(fullscreen_controls)
+        preview_controls.setAlignment(fullscreen_controls, Qt.AlignmentFlag.AlignTop)
+        center.addLayout(preview_controls)
         self.notice = QLabel()
         self.notice.setObjectName("notice")
         self.notice.setWordWrap(True)
@@ -335,8 +391,12 @@ class StudioWindow(QMainWindow):
         self.set_busy(False)
 
     def clear_files(self):
+        self.preview_loader.cancel()
+        self.loading_preview = False
+        self._displayed_source = None
         self.files.clear()
         self.results.clear()
+        self._split_on_load.clear()
         self.outputs.clear()
         self.queue.clear()
         self.canvas.set_images(QPixmap())
@@ -349,33 +409,123 @@ class StudioWindow(QMainWindow):
         source = self.selected_file()
         if not source:
             return
-        try:
-            result = self.results.get(source)
-            if result:
-                self.canvas.set_images(
-                    QPixmap(result["before"]), QPixmap(result["after"]), result["hdr_preview"]
-                )
-                info = result["info"]
-            else:
-                rgb, info = load_image(source, self.background.currentData())
-                self.canvas.set_images(pixmap(rgb))
-            self.image_title.setText(Path(source).name)
-            self.image_title.setToolTip(source)
-            self.image_info.setText(f"{info['width']} x {info['height']} | {info['input_profile']}")
-            self.open_button.setEnabled(source in self.outputs and self.job is None)
-        except Exception as error:
+        if self._displayed_source != source:
             self.canvas.set_images(QPixmap())
-            self.image_info.setText(str(error))
+        self.loading_preview = True
+        self.canvas.set_hdr_suspended(source == self.processing_source)
+        if source == self.processing_source:
+            self.canvas.mode = "before"
+        self.image_title.setText(Path(source).name)
+        self.image_title.setToolTip(source)
+        self.preview_loader.submit(
+            load_preview, source, self.results.get(source), self.background.currentData()
+        )
+        self.update_notice()
+
+    def _preview_loaded(self, preview):
+        if self._closing or preview.source != self.selected_file():
+            return
+        self.loading_preview = False
+        self._displayed_source = preview.source
+        if (
+            preview.source in self._split_on_load
+            and not self._selected_processing()
+            and not preview.after.isNull()
+        ):
+            self.canvas.mode = "split"
+            self._split_on_load.discard(preview.source)
+        self.canvas.set_images(
+            QPixmap.fromImage(preview.before), QPixmap.fromImage(preview.after), preview.hdr_path
+        )
+        info = preview.info
+        self.image_info.setText(f"{info['width']} x {info['height']} | {info['input_profile']}")
+        self.open_button.setEnabled(preview.source in self.outputs and self.job is None)
+        self.update_notice()
+
+    def _preview_failed(self, error):
+        if self._closing:
+            return
+        self.loading_preview = False
+        self.canvas.set_images(QPixmap())
+        self.image_info.setText(error)
         self.update_notice()
 
     def set_view(self, mode):
+        if self._selected_processing() or self.loading_preview:
+            return
         self.canvas.mode = mode
         self.canvas.update()
+        self._sync_view_buttons()
+
+    def _sync_view_buttons(self):
+        has_image = not self.canvas.before.isNull()
+        has_result = not self.canvas.after.isNull()
+        current = self.canvas.mode if has_result else "before"
+        self.view_group.setExclusive(False)
+        for mode, button in self.view_buttons.items():
+            enabled = (
+                has_image
+                and not self._selected_processing()
+                and not self.loading_preview
+                and (mode == "before" or has_result)
+            )
+            button.setEnabled(enabled)
+            button.setChecked(has_image and mode == current)
+        self.view_group.setExclusive(True)
+
+    def show_fullscreen_preview(self):
+        if (
+            self._selected_processing()
+            or self.loading_preview
+            or self.canvas.before.isNull()
+            or self.fullscreen_preview is not None
+        ):
+            return
+        self.fullscreen_preview = FullscreenPreview(
+            self.canvas, self, self.fullscreen_scale.currentData()
+        )
+        self.fullscreen_preview.source = self.selected_file()
+        self.fullscreen_preview.closed.connect(self._fullscreen_closed)
+        self.fullscreen_preview.showFullScreen()
+
+    def _fullscreen_closed(self):
+        self.fullscreen_preview = None
+
+    def _selected_processing(self):
+        return self.processing_source is not None and self.processing_source == self.selected_file()
+
+    def _set_processing_source(self, source):
+        self.processing_source = source
+        self._split_on_load.discard(source)
+        if (
+            source is not None
+            and self.fullscreen_preview is not None
+            and self.fullscreen_preview.source == source
+        ):
+            self.fullscreen_preview.close()
+        selected = self._selected_processing()
+        if selected:
+            self.canvas.mode = "before"
+            self.canvas.update()
+        self.canvas.set_hdr_suspended(selected)
+        self.update_notice()
 
     def update_notice(self):
         canvas = self.canvas
+        self.fullscreen_button.setEnabled(
+            not canvas.before.isNull()
+            and not self._selected_processing()
+            and not self.loading_preview
+        )
+        self._sync_view_buttons()
         display = canvas.display_info
-        if canvas.hdr_active:
+        if self.loading_preview:
+            self.display_status.setText("Preparing preview...")
+            note = "Loading the selected image in the background."
+        elif canvas.hdr_loading:
+            self.display_status.setText("Preparing HDR preview...")
+            note = "The SDR preview remains available while HDR is prepared in the background."
+        elif canvas.hdr_active:
             self.display_status.setText(f"Native HDR | {display.bits}-bit output")
             note = "HDR highlights and wide-gamut values are displayed directly. The original matches the Windows SDR white level."
         elif canvas.hdr_error:
@@ -425,6 +575,7 @@ class StudioWindow(QMainWindow):
         }
         runner = JobRunner(request, self)
         self.job = runner
+        self._set_processing_source(files[0])
         self.last_log = runner.log_path
         runner.event.connect(self.job_event)
         runner.finished.connect(self.job_finished)
@@ -434,7 +585,7 @@ class StudioWindow(QMainWindow):
         runner.start()
 
     def set_busy(self, busy):
-        for widget in (self.add_button, self.clear_button, self.queue, self.settings_panel):
+        for widget in (self.add_button, self.clear_button, self.settings_panel):
             widget.setEnabled(not busy)
         self.preview_button.setEnabled(not busy and bool(self.files))
         self.export_button.setEnabled(not busy and bool(self.files))
@@ -447,23 +598,37 @@ class StudioWindow(QMainWindow):
     def job_event(self, event):
         kind = event.get("event")
         if kind == "progress":
+            source = event.get("source")
+            if source is None and self.job is not None:
+                files = self.job.request["files"]
+                index = event.get("index", -1)
+                if 0 <= index < len(files):
+                    source = files[index]
+            if source is not None and source != self.processing_source:
+                self._set_processing_source(source)
             self.status.setText(
                 f"{event['index'] + 1}/{event['total']} | {event['filename']} | {event['message']}"
             )
         elif kind == "file_done":
             result = event["result"]
             self.results[result["source"]] = result
+            self._split_on_load.add(result["source"])
             if result["output"]:
                 self.outputs[result["source"]] = result["output"]
+            if result["source"] == self.processing_source:
+                self._set_processing_source(None)
             if result["source"] == self.selected_file():
                 self.select_file(self.queue.currentRow())
         elif kind == "file_error":
+            if event["source"] == self.processing_source:
+                self._set_processing_source(None)
             self.status.setText(f"Failed: {Path(event['source']).name}: {event['error']}")
 
     def job_finished(self):
         runner = self.job
         outcome = runner.outcome
         self.job = None
+        self._set_processing_source(None)
         runner.deleteLater()
         self.set_busy(False)
         if outcome.get("cancelled"):
@@ -548,6 +713,7 @@ class StudioWindow(QMainWindow):
             "Created with OpenAI Codex (ChatGPT), an AI coding assistant, under human direction.\n\n"
             "1. Add SDR images and adjust the NVIDIA parameters.\n"
             "2. Generate a preview; drag the comparison divider.\n"
+            "Use Fullscreen or double-click the image to enlarge it. Double-click or press Esc to return.\n"
             "3. Export the queue to verified FP16 scRGB JXR.\n\n"
             "Ctrl+O: add | Ctrl+R: preview | Ctrl+E: export\n\n"
             "Windows wallpaper resizing may lose HDR. Prepare suitable input dimensions yourself. "
@@ -570,8 +736,12 @@ class StudioWindow(QMainWindow):
                 self.status.setText("Waiting for the GPU worker to stop...")
                 event.ignore()
                 return
-        self.canvas.display_timer.stop()
-        self.canvas._disable_hdr()
+        self._closing = True
+        self.preview_loader.close()
+        if self.fullscreen_preview is not None:
+            self.fullscreen_preview.close()
+        self.canvas.shutdown()
+        self.preview_device.close()
         event.accept()
 
 
@@ -589,8 +759,8 @@ def run(initial_files=()) -> int:
         (QPalette.ColorRole.Text, "#e6eaf1"),
         (QPalette.ColorRole.Button, "#2b3542"),
         (QPalette.ColorRole.ButtonText, "#e6eaf1"),
-        (QPalette.ColorRole.Highlight, "#355442"),
-        (QPalette.ColorRole.HighlightedText, "#e6eaf1"),
+        (QPalette.ColorRole.Highlight, "#8bd89a"),
+        (QPalette.ColorRole.HighlightedText, "#12251a"),
     ):
         palette.setColor(role, QColor(color))
     app.setPalette(palette)

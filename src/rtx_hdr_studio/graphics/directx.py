@@ -1,7 +1,8 @@
 """Minimal D3D11 FP16/scRGB presenter. No Qt 8-bit image conversion in this path.
 
 Vtable layouts follow Microsoft's d3d11.h, dxgi1_2.h and dxgi1_4.h.
-All COM objects belong to, and are released on, the GUI thread.
+Devices may be initialized in the background and then handed to the GUI thread.
+Only the GUI thread uses the shared immediate context after that handoff.
 """
 
 from __future__ import annotations
@@ -91,14 +92,11 @@ def query(obj, iid):
     return result
 
 
-class Presenter:
-    """Present opaque RGBA half-float pixels to one native child HWND."""
+class DeviceResources:
+    """Initialize once; transfer exclusive context use to the presentation thread."""
 
-    def __init__(self, hwnd: int, width: int, height: int):
-        self.device, self.context, self.swap, self.buffer = P(), P(), P(), P()
-        self.width = self.height = 0
-        self.frames = 0
-        dxgi_device, adapter, factory, chain = P(), P(), P(), P()
+    def __init__(self):
+        self.device, self.context = P(), P()
         try:
             create = C.windll.d3d11.D3D11CreateDevice
             create.argtypes = [P, U, P, U, P, U, U, P, P, P]
@@ -119,6 +117,30 @@ class Presenter:
                 ),
                 "Create Direct3D 11 device",
             )
+        except Exception:
+            self.close()
+            raise
+
+    def close(self):
+        release(self.context)
+        release(self.device)
+
+    def __del__(self):
+        self.close()
+
+
+class Presenter:
+    """Present opaque RGBA half-float pixels to one native child HWND."""
+
+    def __init__(self, hwnd: int, width: int, height: int, resources=None):
+        self.owns_resources = resources is None
+        self.resources = resources if resources is not None else DeviceResources()
+        self.device, self.context = self.resources.device, self.resources.context
+        self.swap, self.buffer = P(), P()
+        self.width = self.height = 0
+        self.frames = 0
+        dxgi_device, adapter, factory, chain = P(), P(), P(), P()
+        try:
             dxgi_device = query(self.device, "54ec77fa-1377-44e6-8c32-88fd5f44c84c")
             check(
                 method(dxgi_device, 7, HR, P)(dxgi_device, C.byref(adapter)), "Get graphics adapter"
@@ -231,5 +253,7 @@ class Presenter:
             release(staging)
 
     def close(self):
-        for obj in (self.buffer, self.swap, self.context, self.device):
+        for obj in (self.buffer, self.swap):
             release(obj)
+        if self.owns_resources:
+            self.resources.close()

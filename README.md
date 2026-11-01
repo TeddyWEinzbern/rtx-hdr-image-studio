@@ -10,7 +10,7 @@ Created with **OpenAI Codex (ChatGPT)** under the direction of **TeddyWEinzbern*
 
 - English GUI with drag-and-drop, batch processing, presets, and cancellation.
 - Peak luminance, contrast, saturation, middle gray, debanding, exposure, and GPU selection.
-- Native Direct3D 11 FP16/scRGB HDR preview, split comparison, and SDR tone-mapped fallback.
+- Native Direct3D 11 FP16/scRGB HDR preview, split comparison, SDR tone-mapped fallback, and full-screen viewing.
 - EXIF orientation and embedded ICC input conversion to sRGB; explicit alpha compositing.
 - Full-resolution FP16 JXR export with exact decoded-sample verification and collision-safe filenames.
 - Separate GPU worker process, so a native SDK failure does not take down the interface.
@@ -65,12 +65,20 @@ Dependencies are declared in [pyproject.toml](pyproject.toml). Install `.[gpu]` 
 ## Use
 
 1. Choose **Add images**, or drop PNG/JPEG/WebP/BMP/TIFF files into the window.
-2. Choose a preset or adjust the parameters.
+2. Choose a preset or adjust the parameters. Built-in presets include **NVIDIA default**, **HDR400** (400 nit, middle gray 50), **HDR600** (640 nit, middle gray 80), **HDR1000** (1000 nit, middle gray 100), and **HDR1000 Highlight** (1000 nit, middle gray 80). The four HDR presets use contrast/saturation 100, exposure 0 EV, debanding enabled, standard sRGB input, black alpha compositing, and GPU index 0.
 3. Choose **Generate preview**. Drag the divider or choose Original/Processed.
 4. Leave **Automatic HDR** selected for native HDR, or select **SDR tone-mapped**.
 5. Choose **Export JXR** to export the queue with the current settings.
 
-Parameter changes do not automatically re-run inference; an outdated preview is labeled. Preview caches use a maximum dimension of 1600 pixels, while inference and export preserve the source dimensions.
+Parameter changes do not automatically re-run inference; an outdated preview is labeled. Preview caches fit within **3840 × 2160 pixels**: exceeding either width or height scales both dimensions proportionally, without upscaling smaller images. Inference and export preserve the source dimensions. Generate a new preview to replace any older, smaller cache.
+
+Preview image decoding, HDR data preparation, frame resizing, and Direct3D device initialization run in the background. The window shows **Preparing preview** or **Preparing HDR preview** while those tasks finish; the rendering device is reused across previews and full-screen views. Rapid image changes discard outdated loading results.
+
+While an image is being processed, its view returns to **Original**, any full-screen view of that image closes, and its preview-mode and Fullscreen buttons are disabled. Double-click cannot reopen it until processing finishes. The image queue stays available: other unprocessed and previously processed images retain their usual viewing controls. For a batch, the restriction follows the file currently being processed and is released on completion, failure, or cancellation. Successfully completed images automatically open in **Split comparison** once their new preview loads. If another image is selected, its view stays unchanged; the completed image opens in Split comparison when next selected.
+
+Choose the blue **Fullscreen** button below the preview, or double-click the image, to view it on its display. The image and comparison mode are fixed until you exit. In Split comparison, hold the left mouse button on the image and drag horizontally to adjust the divider; its position stays within the displayed image in all scaling modes. This adjustment applies to the current full-screen view. A centered hint explains how to exit and disappears after three seconds; mouse activity does not show it again. Double-click the image or press **Esc** to return. Switching away from the application also closes the full-screen preview. **Processed** and **Split comparison** remain disabled until the selected image has a generated preview; **Original** and full-screen viewing are available as soon as the source image is loaded.
+
+The active preview mode is highlighted on its button. The three mode buttons stay grouped on the left in **Original / Processed / Split comparison** order; Fullscreen and its scaling selector stay on the right without stretching across a wide window. Choose **Keep aspect ratio** (default) to fit the screen, **Fill** to keep the aspect ratio and crop centrally to cover the screen, **Stretch** to fill it without preserving the aspect ratio, or **No scaling** for one preview pixel per physical display pixel, centered on screen. No scaling automatically fits while keeping aspect ratio if either image dimension exceeds the screen. Dropdowns and the image queue use light selection highlights on dark backgrounds.
 
 | Parameter | Range | Default |
 | --- | --- | --- |

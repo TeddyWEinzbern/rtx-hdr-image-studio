@@ -8,6 +8,7 @@ from PIL import Image, ImageCms, ImageOps
 
 SUPPORTED = frozenset({".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"})
 MAX_PIXELS = 40_000_000
+PREVIEW_BOUNDS = (3840, 2160)
 
 
 def load_image(path: str | Path, background: str = "black") -> tuple[np.ndarray, dict]:
@@ -50,15 +51,15 @@ def load_image(path: str | Path, background: str = "black") -> tuple[np.ndarray,
         }
 
 
-def resize_linear(rgb: np.ndarray, width: int, height: int) -> np.ndarray:
+def resize_linear(rgb: np.ndarray, width: int, height: int, box=None) -> np.ndarray:
     """Bilinear filtering in linear light, retaining negative and >1 samples."""
-    if rgb.shape[:2] == (height, width):
+    if box is None and rgb.shape[:2] == (height, width):
         return np.asarray(rgb, dtype=np.float32)
     return np.stack(
         [
             np.asarray(
                 Image.fromarray(np.asarray(rgb[..., c], np.float32)).resize(
-                    (width, height), Image.Resampling.BILINEAR
+                    (width, height), Image.Resampling.BILINEAR, box=box
                 )
             )
             for c in range(3)
@@ -67,15 +68,22 @@ def resize_linear(rgb: np.ndarray, width: int, height: int) -> np.ndarray:
     )
 
 
+def preview_size(width: int, height: int) -> tuple[int, int]:
+    """Fit inside the preview bounds without upscaling or changing orientation."""
+    scale = min(1.0, PREVIEW_BOUNDS[0] / width, PREVIEW_BOUNDS[1] / height)
+    return max(1, round(width * scale)), max(1, round(height * scale))
+
+
 def save_sdr_preview(path: Path, rgb: np.ndarray) -> None:
     image = Image.fromarray(rgb)
-    image.thumbnail((1600, 1600), Image.Resampling.LANCZOS)
+    size = preview_size(*image.size)
+    if image.size != size:
+        image = image.resize(size, Image.Resampling.LANCZOS)
     profile = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
     image.save(path, format="PNG", icc_profile=profile)
 
 
 def save_hdr_preview(path: Path, scrgb: np.ndarray) -> None:
     height, width = scrgb.shape[:2]
-    scale = min(1.0, 1600 / max(width, height))
-    preview = resize_linear(scrgb, max(1, round(width * scale)), max(1, round(height * scale)))
+    preview = resize_linear(scrgb, *preview_size(width, height))
     np.save(path, preview.astype(np.float16), allow_pickle=False)

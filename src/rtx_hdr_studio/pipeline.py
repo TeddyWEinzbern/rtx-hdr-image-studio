@@ -41,6 +41,7 @@ def process_files(
                     {
                         "event": "progress",
                         "index": index,
+                        "source": source,
                         "total": len(files),
                         "filename": Path(source).name,
                         "message": message,
