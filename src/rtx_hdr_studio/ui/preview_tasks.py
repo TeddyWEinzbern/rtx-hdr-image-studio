@@ -1,6 +1,8 @@
 """Coalesced background preparation. Workers never access Qt widgets or GPU contexts."""
 
+import logging
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
@@ -8,7 +10,7 @@ import numpy as np
 from PySide6.QtCore import QObject, Signal
 from PySide6.QtGui import QImage
 
-from ..color import srgb_to_linear
+from ..color import srgb8_to_linear, srgb_to_linear
 from ..image_io import image_info, load_image, resize_linear
 from ..resources import ScratchSpace
 from .geometry import image_placement
@@ -18,8 +20,12 @@ DEVICE_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="hdr-device")
 IMAGE_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="image-decode")
 
 
-def source_info(source):
-    return source, image_info(source)
+def source_info(source, decoder=None):
+    """Header-only metadata; parsed in the decoder process when one is given."""
+    if decoder is None:
+        return source, image_info(source)
+    header, _ = decoder.request("info", path=source)
+    return source, header["info"]
 
 
 class LatestTask(QObject):
@@ -96,12 +102,22 @@ class LoadedPreview:
     info: dict
 
 
-def load_preview(source, result, background):
+def load_preview(source, result, background, decoder=None):
     if result:
+        # Our own bounded PNG caches; decoding them in-process is safe and fast.
         before, after = QImage(result["before"]), QImage(result["after"])
         if before.isNull() or after.isNull():
             raise ValueError("Preview cache is unavailable. Generate the preview again.")
         return LoadedPreview(source, before, after, result["hdr_preview"], result["info"])
+    if decoder is not None:
+        # Untrusted source files are decoded in a killable, crash-isolated process.
+        header, payload = decoder.request("preview", path=source, background=background)
+        height, width, channels = header["shape"]
+        if channels != 3 or len(payload) != height * width * 3:
+            raise ValueError("The image decoder returned an invalid preview.")
+        pixels = np.frombuffer(payload, np.uint8)
+        before = QImage(pixels.data, width, height, width * 3, QImage.Format.Format_RGB888)
+        return LoadedPreview(source, before.copy(), QImage(), None, header["info"])
     with ScratchSpace():
         rgb, info = load_image(source, background, preview=True)
         height, width = rgb.shape[:2]
@@ -113,7 +129,7 @@ def image_to_linear(image):
     image = image.convertToFormat(QImage.Format.Format_RGBA8888)
     data = np.frombuffer(image.constBits(), np.uint8).reshape(image.height(), image.bytesPerLine())
     rgb = data[:, : image.width() * 4].reshape(image.height(), image.width(), 4)[..., :3]
-    return srgb_to_linear(rgb.astype(np.float32) / np.float32(255))
+    return srgb8_to_linear(rgb)  # 256-entry table; identical to the float formula.
 
 
 def load_hdr(image, path):
@@ -185,14 +201,21 @@ def prepare_frames(before_linear, after_linear, width, height, white, mode, marg
 
 
 class PreviewDevice(QObject):
+    """One D3D11 device shared by every HDR surface; rebuilt after device loss."""
+
     ready = Signal()
     failed = Signal(str)
+    lost = Signal()  # Surfaces must release swap chains and textures immediately.
+    MAX_RECOVERIES = 3
+    RECOVERY_WINDOW = 60.0
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.resources = None
         self.requested = False
         self.error = ""
+        self._closed = False
+        self._recoveries = []
         self.task = LatestTask(self, DEVICE_POOL)
         self.task.ready.connect(self._ready)
         self.task.failed.connect(self._failed)
@@ -217,7 +240,26 @@ class PreviewDevice(QObject):
             self.error = ""
             self.requested = False
 
+    def report_lost(self, message):
+        """DXGI reported device removal/reset: release everything, then reinitialize."""
+        if self._closed or self.resources is None:
+            return  # Shutting down, or another surface already started the rebuild.
+        now = time.monotonic()
+        self._recoveries = [t for t in self._recoveries if now - t < self.RECOVERY_WINDOW]
+        self._recoveries.append(now)
+        logging.getLogger(__name__).warning("Graphics device lost: %s", message)
+        self.lost.emit()
+        resources, self.resources = self.resources, None
+        resources.close()
+        self.requested = False
+        if len(self._recoveries) > self.MAX_RECOVERIES:
+            # Avoid an endless rebuild loop; keep the SDR fallback with a reason.
+            self._failed(f"The graphics device was reset repeatedly. {message}")
+            return
+        self.ensure()
+
     def close(self):
+        self._closed = True
         self.task.close()
         if self.resources is not None:
             self.resources.close()

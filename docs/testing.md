@@ -1,5 +1,42 @@
 # Testing and evidence
 
+## Version 1.2.1 validation (2026-11-02)
+
+Version 1.2.1 fixes the findings of two code audits (security/stability/performance and correctness). It adds 92 CPU/UI tests (`test_engine.py`, `test_job_cache.py`, `test_decoder.py`, `test_composition.py`, new cases in `test_images_and_export.py`, and device-loss recovery in `test_preview_async.py`) and 2 Windows native tests (GPU-side split composition read back against the CPU reference, and device-loss fault injection).
+
+| Check | Result |
+| --- | --- |
+| Non-Qt suites in a Linux container (NumPy 2.5, Pillow 12.3; a raw stand-in replaced imagecodecs for the JXR container) | 143 passed |
+| `LatestTask`, `PreviewDevice` loss recovery and `JobRunner` cancellation with a minimal Qt stand-in | Passed |
+| Audit reproduction: 16-bit grayscale PNG/TIFF `[0, 128, 255, 256, 16384, 32768, 65535]` | `[0, 0, 1, 1, 64, 128, 255]` (was `[0, 128, 255, 255, 255, 255, 255]`) |
+| Audit reproduction: cancelled export through `JobRunner` | No `.rtx-hdr-*` file of the job left; another job's staging file untouched |
+| Audit reproduction: closing during a 60 s decode | Whole process exits promptly with `DecoderInterrupted` |
+| Lookup tables vs float formulas (sRGB/gamma 2.2, exposure −3…+3 in 0.05 steps) | 0 mismatches; 4K preview linearization 2391 ms → 30 ms in the container |
+| GPU composition plan vs 1.2.0 CPU frame (3 modes × 6 split positions × 3 scale factors) | Bit-identical |
+| Maximum \|scRGB\| over the full RGB10A2 PQ cube | 207.6 (FP16 limit 65504) |
+| Windows offscreen CPU/UI suite with real Qt and imagecodecs | **215 passed**, 9 deselected |
+| Real NVIDIA inference, C/Python equivalence, worker preview and verified JXR export | **5 passed**, 219 deselected |
+| Windows native FP16 readback/resize, full-screen viewing, GPU composition, device-loss injection | **4 passed**, 220 deselected |
+| Idle live-owner cache retention, stale dead-owner cleanup, quick-selection delayed interruption | Passed in the Windows CPU/UI suite |
+| Isolated wheel and source-distribution builds | Passed |
+| Ruff lint/format | Passed |
+
+The earlier container could not install PySide6 or imagecodecs; its stand-in results above are retained as development history. The Windows results use the real dependencies: NumPy 2.3.4, Pillow 12.3.0, PySide6-Essentials 6.10.1, and imagecodecs 2026.10.10. GPU validation used the RTX 3070 Ti Laptop GPU, driver 621.01, and VFX SDK 1.3.0. Native tests ran with Windows HDR enabled. Device-loss recovery was checked by injecting a failed `Present` HRESULT into the real native surface; no system driver reset was forced. Buffer readback and automated full-screen tests do not establish physical HDR appearance.
+
+Release validation also found and fixed two edge cases: startup cleanup must retain old caches belonging to an idle live instance, and selecting another image before the one-second decode grace period expires must schedule a later interruption check. The cache test uses a real child process, verifies its idle cache is retained, then terminates that child and verifies stale cleanup.
+
+Reproduce the Windows checks with:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install ".[gpu,dev]"
+.\.venv\Scripts\python.exe -m ruff check . ; .\.venv\Scripts\python.exe -m ruff format --check .
+.\.venv\Scripts\python.exe -m pytest -m "not gpu and not native"
+$env:RTX_HDR_RUN_GPU = "1"; .\.venv\Scripts\python.exe -m pytest -m gpu
+$env:QT_QPA_PLATFORM = "windows"; $env:RTX_HDR_RUN_NATIVE = "1"; .\.venv\Scripts\python.exe -m pytest -m native
+```
+
+The audits' remaining low-priority suggestions were deliberately not changed in 1.2.1: display-state polling (`QueryDisplayConfig` every 1.5 s; measure first), pinning GitHub Actions to commit SHAs with a dependency lock file, and removing the GUI-thread QImage/QPixmap round trips on image selection (one-off cost per selection, not per frame).
+
 ## Version 1.2.0 validation (2026-11-02)
 
 | Check | Result |
@@ -11,7 +48,7 @@
 | Ruff lint/format and isolated wheel/sdist builds | Passed |
 | Built package version, 26 Python modules and release-note contents | Verified |
 
-The source/package version is 1.2.0. The measurements below retain their original development context; the front-end pixel ceiling remains distinct from available processing resources.
+The current source/package version is 1.2.1. The measurements below retain their original development context; the front-end pixel ceiling remains distinct from available processing resources.
 
 ## Preview anti-aliasing validation (2026-11-02)
 

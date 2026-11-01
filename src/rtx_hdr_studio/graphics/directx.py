@@ -18,6 +18,29 @@ U = C.c_uint32
 HR = C.c_long
 FP16 = 10  # DXGI_FORMAT_R16G16B16A16_FLOAT
 SCRGB = 1  # DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709
+USAGE_DEFAULT = 0
+BIND_SHADER_RESOURCE = 0x8
+# HRESULTs after which Microsoft requires recreating the device and its resources.
+DEVICE_LOST = {
+    0x887A0005: "DXGI_ERROR_DEVICE_REMOVED",
+    0x887A0006: "DXGI_ERROR_DEVICE_HUNG",
+    0x887A0007: "DXGI_ERROR_DEVICE_RESET",
+    0x887A0020: "DXGI_ERROR_DRIVER_INTERNAL_ERROR",
+}
+
+
+class DirectXError(RuntimeError):
+    """A failed DirectX call that keeps its HRESULT for recovery decisions."""
+
+    def __init__(self, operation, code):
+        self.hresult = code & 0xFFFFFFFF
+        name = DEVICE_LOST.get(self.hresult)
+        suffix = f", {name}" if name else ""
+        super().__init__(f"{operation} failed (0x{self.hresult:08X}{suffix})")
+
+    @property
+    def device_lost(self):
+        return self.hresult in DEVICE_LOST
 
 
 class Guid(C.Structure):
@@ -67,6 +90,21 @@ class Mapped(C.Structure):
     _fields_ = [("data", P), ("row_pitch", U), ("depth_pitch", U)]
 
 
+class SubresourceData(C.Structure):
+    _fields_ = [("data", P), ("row_pitch", U), ("slice_pitch", U)]
+
+
+class Box(C.Structure):
+    _fields_ = [
+        ("left", U),
+        ("top", U),
+        ("front", U),
+        ("right", U),
+        ("bottom", U),
+        ("back", U),
+    ]
+
+
 def method(obj, slot, result, *arguments):
     table = C.cast(obj, C.POINTER(C.POINTER(P))).contents
     return C.WINFUNCTYPE(result, P, *arguments)(table[slot])
@@ -74,7 +112,7 @@ def method(obj, slot, result, *arguments):
 
 def check(code, operation):
     if code < 0:
-        raise RuntimeError(f"{operation} failed (0x{code & 0xFFFFFFFF:08X})")
+        raise DirectXError(operation, code)
 
 
 def release(obj):
@@ -130,13 +168,19 @@ class DeviceResources:
 
 
 class Presenter:
-    """Present opaque RGBA half-float pixels to one native child HWND."""
+    """Present opaque RGBA half-float pixels to one native child HWND.
+
+    Context vtable slots (d3d11.h): 46 CopySubresourceRegion, 47 CopyResource,
+    48 UpdateSubresource. Device slot 5 is CreateTexture2D.
+    """
 
     def __init__(self, hwnd: int, width: int, height: int, resources=None):
         self.owns_resources = resources is None
         self.resources = resources if resources is not None else DeviceResources()
         self.device, self.context = self.resources.device, self.resources.context
         self.swap, self.buffer = P(), P()
+        self.sources = [P(), P()]  # before, after: uploaded once per prepared frame
+        self.source_key = None
         self.width = self.height = 0
         self.frames = 0
         dxgi_device, adapter, factory, chain = P(), P(), P(), P()
@@ -213,6 +257,78 @@ class Presenter:
             self.context, self.buffer, 0, None, pixels.ctypes.data, self.width * 8, 0
         )
 
+    def set_sources(self, key, before: np.ndarray, after: np.ndarray):
+        """Upload the prepared before/after frames to GPU textures, once per key."""
+        if key is not None and key is self.source_key:
+            return
+        self.release_sources()
+        for index, frame in enumerate((before, after)):
+            if frame.shape != (self.height, self.width, 4) or frame.dtype != np.float16:
+                raise ValueError("HDR pixels must be FP16 RGBA matching the surface dimensions.")
+            pixels = np.ascontiguousarray(frame)
+            desc = TextureDesc(
+                self.width,
+                self.height,
+                1,
+                1,
+                FP16,
+                SampleDesc(1, 0),
+                USAGE_DEFAULT,
+                BIND_SHADER_RESOURCE,
+                0,
+                0,
+            )
+            initial = SubresourceData(pixels.ctypes.data, self.width * 8, 0)
+            texture = P()
+            check(
+                method(self.device, 5, HR, P, P, P)(
+                    self.device, C.byref(desc), C.byref(initial), C.byref(texture)
+                ),
+                "Create HDR source texture",
+            )
+            self.sources[index] = texture
+        self.source_key = key
+
+    def release_sources(self):
+        for texture in self.sources:
+            release(texture)
+        self.source_key = None
+
+    def copy_full(self, source: int):
+        """Backbuffer <- whole source texture (same size and format)."""
+        method(self.context, 47, None, P, P)(self.context, self.buffer, self.sources[source])
+
+    def copy_region(self, source: int, left: int, right: int):
+        """Backbuffer columns [left, right) <- the same columns of a source texture."""
+        left, right = max(0, left), min(self.width, right)
+        if right <= left:
+            return
+        box = Box(left, 0, 0, right, self.height, 1)
+        method(self.context, 46, None, P, U, U, U, U, P, U, P)(
+            self.context, self.buffer, 0, left, 0, 0, self.sources[source], 0, C.byref(box)
+        )
+
+    def upload_region(self, x: int, y: int, rgba: np.ndarray):
+        """Small CPU patch (divider, overlay) into the backbuffer."""
+        height, width = rgba.shape[:2]
+        if (
+            rgba.ndim != 3
+            or rgba.shape[2] != 4
+            or rgba.dtype != np.float16
+            or x < 0
+            or y < 0
+            or x + width > self.width
+            or y + height > self.height
+        ):
+            raise ValueError("HDR patch must be FP16 RGBA inside the surface.")
+        if width == 0 or height == 0:
+            return
+        pixels = np.ascontiguousarray(rgba)
+        box = Box(x, y, 0, x + width, y + height, 1)
+        method(self.context, 48, None, P, U, P, P, U, U)(
+            self.context, self.buffer, 0, C.byref(box), pixels.ctypes.data, width * 8, 0
+        )
+
     def present(self):
         check(method(self.swap, 8, HR, U, U)(self.swap, 1, 0), "Present HDR frame")
         self.frames += 1
@@ -253,6 +369,7 @@ class Presenter:
             release(staging)
 
     def close(self):
+        self.release_sources()
         for obj in (self.buffer, self.swap):
             release(obj)
         if self.owns_resources:

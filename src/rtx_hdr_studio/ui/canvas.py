@@ -231,9 +231,22 @@ class CompareCanvas(QWidget):
     def paint_overlay(self, painter):
         """Paint optional controls over the SDR image."""
 
+    def overlay_rect(self, width, height):
+        """Physical-pixel rectangle (x, y, w, h) of an HDR overlay, or None."""
+        return None
+
+    def blend_overlay(self, patch):
+        """Blend the overlay in linear light into ``patch`` (exactly overlay_rect)."""
+
     def composite_overlay(self, frame):
         """Composite optional controls in linear light over a native HDR frame."""
-        return frame
+        rect = self.overlay_rect(frame.shape[1], frame.shape[0])
+        if rect is None:
+            return frame
+        x, y, width, height = rect
+        result = frame.copy()
+        self.blend_overlay(result[y : y + height, x : x + width])
+        return result
 
     def paintEvent(self, event):
         painter = QPainter(self)

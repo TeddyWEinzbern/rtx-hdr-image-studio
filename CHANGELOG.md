@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.2.1 - 2026-11-02
+
+Security, stability, and performance fixes from the 2026-11-02 code audits.
+
+- Security: restrict Pillow's content sniffing to the PNG, JPEG, WebP, BMP, and TIFF decoders, so a renamed EPS/PSD/FITS/PDF file can no longer reach Ghostscript or other high-risk decoders. Upgrade Pillow to 12.3.0 (CVE-2026-25990, CVE-2026-42311, CVE-2026-40192 and related fixes).
+- Fix unsigned 16-bit grayscale PNG/TIFF input being clipped to white: values are now scaled from the full 0–65535 range in previews and processing. Signed-integer and floating-point images are rejected with a clear message instead of being clipped.
+- Decode source images in killable helper processes. A native decoder crash no longer closes the window, a slow decode of an image you have moved away from is abandoned, and closing the window no longer leaves the process running until a large decode finishes.
+- Delete preview/job caches that are no longer referenced, all of a session's caches on exit, and crash leftovers older than 24 hours at start-up (previously every preview and export left ~60 MiB or more behind permanently). Caches with a live recorded owner are retained even after a day of inactivity.
+- Remove unfinished `.rtx-hdr-*` export files from the output folder after a cancelled or terminated export; files of other jobs and finished exports are untouched.
+- Native HDR preview uploads each frame pair to the GPU once; repaints, including every mouse move while dragging the divider, are GPU copies plus a small divider/hint upload instead of a full FP16 frame copy and upload (about 63 MiB per repaint at 4K).
+- Recover the native HDR preview after a graphics driver reset or device removal by rebuilding the shared Direct3D device, instead of staying in SDR fallback until restart; repeated losses keep the SDR fallback with an explanation.
+- Report the original NVIDIA error with the file name when GPU processing fails, instead of a secondary CUDA synchronization error.
+- Prepare TrueHDR input and linearize preview originals with exact 256-entry lookup tables (byte-identical results; 4K preview linearization drops from seconds to tens of milliseconds). Collect HDR statistics during conversion and skip the redundant export range scan for NVIDIA output, saving two full passes over large images.
+- Start worker and decoder processes with `python -P`; rotate `application.log` at 1 MiB with three backups.
+- Credit Claude AI (Anthropic) alongside OpenAI Codex (ChatGPT) in the AI disclosure.
+
 ## 1.2.0 - 2026-11-02
 
 - Set saturation to 150 for HDR400, HDR600, HDR1000, and HDR1000 Highlight presets.

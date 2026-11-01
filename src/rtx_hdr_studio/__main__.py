@@ -3,6 +3,7 @@
 import argparse
 import logging
 import sys
+from logging.handlers import RotatingFileHandler
 
 from . import __version__
 from .runtime import cache_dir
@@ -15,8 +16,12 @@ def main() -> int:
     args = parser.parse_args()
     if sys.platform != "win32":
         parser.error("The desktop application requires Windows 11 x64.")
+    # Bounded log: 1 MiB plus three rotated files.
+    handler = RotatingFileHandler(
+        cache_dir() / "application.log", maxBytes=1024**2, backupCount=3, encoding="utf-8"
+    )
     logging.basicConfig(
-        filename=cache_dir() / "application.log",
+        handlers=[handler],
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )

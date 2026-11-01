@@ -1,3 +1,3 @@
-"""Local NVIDIA TrueHDR image processing, built with OpenAI Codex (ChatGPT)."""
+"""Local NVIDIA TrueHDR image processing, built with OpenAI Codex (ChatGPT) and Claude AI."""
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"

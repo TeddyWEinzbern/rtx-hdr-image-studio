@@ -4,6 +4,7 @@ from PIL import Image, ImageCms
 
 from rtx_hdr_studio.export import write_jxr
 from rtx_hdr_studio.image_io import (
+    image_info,
     load_image,
     preview_size,
     resize_linear,
@@ -31,6 +32,84 @@ def test_orientation_and_icc(tmp_path):
     image.save(path, exif=exif, icc_profile=profile)
     rgb, info = load_image(path)
     assert rgb.shape == (6, 4, 3) and "sRGB" in info["input_profile"]
+
+
+GRAY16 = np.array([[0, 128, 255, 256, 16384, 32768, 65535]], np.uint16)
+GRAY16_AS_8BIT = [0, 0, 1, 1, 64, 128, 255]
+
+
+@pytest.mark.parametrize(
+    "name, mode", [("gray.png", "I;16"), ("gray.tiff", "I;16"), ("big.tiff", "I;16B")]
+)
+def test_unsigned_16bit_grayscale_uses_the_full_input_range(tmp_path, name, mode):
+    path = tmp_path / name
+    raw = GRAY16.astype(">u2" if mode == "I;16B" else "<u2").tobytes()
+    Image.frombytes(mode, GRAY16.shape[::-1], raw).save(path)
+    with Image.open(path) as opened:
+        assert opened.mode == mode  # Guard the fixture, not only the result.
+    rgb, _ = load_image(path)
+    np.testing.assert_array_equal(rgb[0], np.repeat(np.array(GRAY16_AS_8BIT)[:, None], 3, 1))
+
+
+def test_unsigned_16bit_grayscale_preview_keeps_mid_gray(tmp_path):
+    path = tmp_path / "large.png"
+    Image.fromarray(np.full((2200, 4000), 32768, np.uint16)).save(path)
+    rgb, info = load_image(path, preview=True)
+    assert rgb.shape == (2112, 3840, 3) and (info["width"], info["height"]) == (4000, 2200)
+    assert np.all(rgb == 128)
+
+
+def test_unsigned_16bit_grayscale_key_transparency_is_composited(tmp_path):
+    import struct
+    import zlib
+
+    def chunk(kind, data):
+        return (
+            struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+        )
+
+    pixels = np.array([[32768, 65535, 1000]], ">u2")
+    path = tmp_path / "keyed.png"
+    path.write_bytes(
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", 3, 1, 16, 0, 0, 0, 0))
+        + chunk(b"tRNS", struct.pack(">H", 1000))
+        + chunk(b"IDAT", zlib.compress(b"\0" + pixels.tobytes()))
+        + chunk(b"IEND", b"")
+    )
+    black, info = load_image(path)
+    white, _ = load_image(path, "white")
+    assert info["transparency_composited"]
+    assert black[0, :, 0].tolist() == [128, 255, 0]
+    assert white[0, :, 0].tolist() == [128, 255, 255]
+
+
+@pytest.mark.parametrize("array", [GRAY16.astype(np.float32), GRAY16.astype(np.int32)])
+def test_signed_and_floating_point_inputs_are_rejected_instead_of_clipped(tmp_path, array):
+    path = tmp_path / "unsupported.tiff"
+    Image.fromarray(array).save(path)
+    for read in (image_info, load_image):
+        with pytest.raises(ValueError, match="Unsupported pixel format"):
+            read(path)
+
+
+def test_content_sniffing_is_limited_to_supported_decoders(tmp_path):
+    path = tmp_path / "holiday.png"
+    Image.new("RGB", (8, 8), "red").save(path, format="EPS")
+    with Image.open(path) as unrestricted:
+        assert unrestricted.format == "EPS"  # Pillow would hand this to Ghostscript.
+    for read in (image_info, load_image):
+        with pytest.raises(ValueError, match="not a readable"):
+            read(path)
+
+
+def test_multi_picture_camera_jpeg_still_opens(tmp_path):
+    path = tmp_path / "camera.jpg"
+    Image.new("RGB", (8, 6), "red").save(
+        path, format="MPO", save_all=True, append_images=[Image.new("RGB", (8, 6), "blue")]
+    )
+    rgb, info = load_image(path)
+    assert rgb.shape == (6, 8, 3) and info["width"] == 8
 
 
 def test_export_preserves_hdr_and_odd_dimensions_without_overwriting(tmp_path):

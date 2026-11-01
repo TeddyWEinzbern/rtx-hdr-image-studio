@@ -1,4 +1,5 @@
 import threading
+import time
 from pathlib import Path
 
 import numpy as np
@@ -238,12 +239,12 @@ def test_preview_loader_drops_old_image_without_blocking_gui(
     main_thread = threading.get_ident()
     workers = []
 
-    def slow_load(source, result, background):
+    def slow_load(source, result, background, *decoder):
         workers.append(threading.get_ident())
         if source == first:
             started.set()
             assert release.wait(5)
-        return original(source, result, background)
+        return original(source, result, background, *decoder)
 
     monkeypatch.setattr(window_module, "load_preview", slow_load)
     beats = []
@@ -298,6 +299,57 @@ def test_latest_task_coalesces_requests_and_suppresses_late_results(wait_until):
         task.close()
 
 
+def test_quick_selection_interrupts_old_decode_after_the_grace_period(
+    images_window, monkeypatch, wait_until
+):
+    from rtx_hdr_studio.decoder import DecoderInterrupted
+
+    window, (_, second, third) = images_window
+    started, release = threading.Event(), threading.Event()
+    original = window_module.load_preview
+    window.preview_decoder.close()
+
+    class SlowDecoder:
+        active = None
+
+        def start(self):
+            pass
+
+        def interrupt(self, unless_path=None, min_seconds=1.0):
+            if self.active is None or self.active[0] == unless_path:
+                return False
+            if time.monotonic() - self.active[1] < min_seconds:
+                return False
+            release.set()
+            return True
+
+        def close(self):
+            release.set()
+
+    decoder = SlowDecoder()
+    window.preview_decoder = decoder
+
+    def slow_load(source, result, background, client):
+        if source == second:
+            decoder.active = (source, time.monotonic())
+            started.set()
+            assert release.wait(5)
+            raise DecoderInterrupted("Obsolete decode stopped")
+        return original(source, result, background, client)
+
+    monkeypatch.setattr(window_module, "load_preview", slow_load)
+    try:
+        window.queue.setCurrentRow(1)
+        wait_until(started.is_set)
+        window.queue.setCurrentRow(2)
+        assert not release.is_set()  # The selection preceded the one-second threshold.
+        wait_until(lambda: window._displayed_source == third and not window.loading_preview)
+        assert release.is_set()
+        assert window.canvas.before.toImage().pixelColor(0, 0).name() == "#008000"
+    finally:
+        release.set()
+
+
 def test_device_initializes_off_thread_and_is_reused(monkeypatch, wait_until):
     from rtx_hdr_studio.graphics import directx
 
@@ -322,6 +374,46 @@ def test_device_initializes_off_thread_and_is_reused(monkeypatch, wait_until):
     service.close()
     app.processEvents()
     assert calls[-1] == ("close", main)
+
+
+def test_device_loss_rebuilds_the_shared_device_and_stops_retrying(monkeypatch, wait_until):
+    from rtx_hdr_studio.graphics import directx
+
+    app = QApplication.instance() or QApplication([])
+    created, closed, events = [], [], []
+
+    class Device:
+        def __init__(self):
+            created.append(self)
+
+        def close(self):
+            closed.append(self)
+
+    monkeypatch.setattr(directx, "DeviceResources", Device)
+    service = PreviewDevice()
+    service.lost.connect(lambda: events.append(("lost", service.resources)))
+    service.failed.connect(lambda message: events.append(("failed", message)))
+    service.ensure()
+    wait_until(lambda: service.resources is not None)
+    first = service.resources
+    service.report_lost("Present HDR frame failed (0x887A0005)")
+    service.report_lost("A second surface reports the same loss")
+    # Surfaces are told before the old device is released, and only once.
+    assert events == [("lost", first)] and closed == [first]
+    wait_until(lambda: service.resources is not None)
+    assert service.resources is not first and len(created) == 2
+    for _ in range(service.MAX_RECOVERIES - 1):
+        service.report_lost("Lost again")
+        wait_until(lambda: service.resources is not None)
+    service.report_lost("Lost once too often")
+    assert events[-1][0] == "failed" and "repeatedly" in events[-1][1]
+    assert service.resources is None and service.error
+    service.ensure()  # No endless rebuild loop.
+    app.processEvents()
+    assert len(created) == service.MAX_RECOVERIES + 1
+    service.close()
+    service.report_lost("Lost during shutdown")
+    assert events[-1][0] == "failed"
 
 
 def test_background_frame_preparation_preserves_hdr_range():

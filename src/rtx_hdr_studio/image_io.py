@@ -4,7 +4,7 @@ import io
 from pathlib import Path
 
 import numpy as np
-from PIL import Image, ImageCms, ImageOps
+from PIL import Image, ImageCms, ImageOps, UnidentifiedImageError
 
 from .resources import (
     MAX_PIXELS,
@@ -16,6 +16,16 @@ from .resources import (
 )
 
 SUPPORTED = frozenset({".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"})
+# Pillow identifies files by content, not by extension. Restrict identification to
+# the decoders this application supports so that a renamed EPS, PSD, FITS, PDF, etc.
+# can never reach Ghostscript or a rarely used decoder. (JPEG still covers MPO.)
+PIL_FORMATS = ("PNG", "JPEG", "WEBP", "BMP", "TIFF")
+# Unsigned 16-bit grayscale is scaled from the full 0..65535 range (AUD-001).
+UINT16_GRAY = frozenset({"I;16", "I;16L", "I;16B", "I;16N"})
+# 8-bit modes that Pillow converts to RGB without changing their numeric range.
+EIGHT_BIT_MODES = frozenset(
+    {"1", "L", "LA", "La", "P", "PA", "RGB", "RGBA", "RGBa", "RGBX", "CMYK", "YCbCr", "LAB"}
+)
 # A finite decoder guard, shared by workers and background GUI loaders.
 Image.MAX_IMAGE_PIXELS = MAX_PIXELS
 PREVIEW_BOUNDS = (3840, 2160)
@@ -24,7 +34,38 @@ PREVIEW_FILTER = Image.Resampling.LANCZOS
 REDUCING_GAP = 3.0  # Area prefilter for large reductions, then a Lanczos-3 finish.
 
 
+def _open(path: Path):
+    if path.suffix.lower() not in SUPPORTED:
+        raise ValueError("Choose a PNG, JPEG, WebP, BMP, or TIFF image.")
+    try:
+        return Image.open(path, formats=PIL_FORMATS)
+    except UnidentifiedImageError as error:
+        raise ValueError(
+            f"{path.name} is not a readable PNG, JPEG, WebP, BMP, or TIFF image."
+        ) from error
+
+
+def _check_mode(opened):
+    if opened.mode not in UINT16_GRAY and opened.mode not in EIGHT_BIT_MODES:
+        raise ValueError(
+            f"Unsupported pixel format ({opened.mode}). Convert the image to 8-bit or "
+            "unsigned 16-bit RGB or grayscale first."
+        )
+
+
+def _uint16_gray_to_l(image, transparency=None):
+    """Full-range unsigned 16-bit gray -> 8-bit L (+ optional tRNS alpha)."""
+    values = np.asarray(image).astype(np.uint32, copy=False)
+    # round(v * 255 / 65535) in exact integer arithmetic; 65535 is odd, so no ties.
+    gray = ((values * 510 + 65535) // 131070).astype(np.uint8)
+    alpha = None
+    if isinstance(transparency, int):
+        alpha = Image.fromarray(np.where(values == transparency, 0, 255).astype(np.uint8))
+    return Image.fromarray(gray), alpha
+
+
 def _info(opened, path):
+    _check_mode(opened)
     width, height = opened.size
     validate_size(width, height)
     # PNG's getexif override decodes IDAT when eXIf is absent. Header queries
@@ -51,7 +92,7 @@ def _info(opened, path):
 
 def image_info(path):
     path = Path(path)
-    with Image.open(path) as opened:
+    with _open(path) as opened:
         return _info(opened, path)[0]
 
 
@@ -59,11 +100,9 @@ def load_image(
     path: str | Path, background: str = "black", *, preview=False
 ) -> tuple[np.ndarray, dict]:
     path = Path(path)
-    if path.suffix.lower() not in SUPPORTED:
-        raise ValueError("Choose a PNG, JPEG, WebP, BMP, or TIFF image.")
     if background not in ("black", "white"):
         raise ValueError("Background must be black or white.")
-    with Image.open(path) as opened:
+    with _open(path) as opened:
         info, profile = _info(opened, path)
         orientation = Image.Image.getexif(opened).get(274, 1)
         if preview:
@@ -97,9 +136,15 @@ def load_image(
         rows = strip_rows(opened.width)
         for y in range(0, opened.height, rows):
             strip = opened.crop((0, y, opened.width, min(y + rows, opened.height)))
-            alpha = (
-                strip.convert("RGBA").getchannel("A") if info["transparency_composited"] else None
-            )
+            if strip.mode in UINT16_GRAY:
+                # Pillow's direct I;16 -> RGB conversion clips at 255 instead of scaling.
+                strip, alpha = _uint16_gray_to_l(strip, opened.info.get("transparency"))
+            else:
+                alpha = (
+                    strip.convert("RGBA").getchannel("A")
+                    if info["transparency_composited"]
+                    else None
+                )
             source = strip if strip.mode in ("CMYK", "LAB") else strip.convert("RGB")
             converted = (
                 ImageCms.applyTransform(source, transform) if transform else source.convert("RGB")

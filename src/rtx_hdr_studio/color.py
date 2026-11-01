@@ -20,6 +20,18 @@ def srgb_to_linear(rgb: np.ndarray) -> np.ndarray:
     return np.where(rgb <= 0.04045, rgb / 12.92, ((rgb + 0.055) / 1.055) ** 2.4)
 
 
+# Exact lookup for 8-bit sRGB codes; identical to srgb_to_linear(code / 255) in float32.
+SRGB8_TO_LINEAR = srgb_to_linear(np.arange(256, dtype=np.float32) / np.float32(255)).astype(
+    np.float32
+)
+
+
+def srgb8_to_linear(rgb8: np.ndarray) -> np.ndarray:
+    if rgb8.dtype != np.uint8:
+        raise ValueError("srgb8_to_linear expects uint8 sRGB codes.")
+    return SRGB8_TO_LINEAR[rgb8]
+
+
 def linear_to_srgb(rgb: np.ndarray) -> np.ndarray:
     rgb = np.maximum(np.asarray(rgb, dtype=np.float32), 0)
     return np.where(rgb <= 0.0031308, rgb * 12.92, 1.055 * rgb ** (1 / 2.4) - 0.055)
@@ -58,20 +70,33 @@ def sdr_preview(scrgb: np.ndarray, peak_nits: float = 650) -> np.ndarray:
     return np.round(np.clip(linear_to_srgb(rgb), 0, 1) * 255).astype(np.uint8)
 
 
+class HdrStatistics:
+    """Strip-wise accumulator, so producers can collect statistics while writing."""
+
+    def __init__(self):
+        self.peak, self.total, self.negative, self.above, self.count = 0.0, 0.0, 0, 0, 0
+
+    def add(self, pixels: np.ndarray) -> None:
+        luminance = np.maximum(pixels @ LUMA_709, 0) * 80
+        self.peak = max(self.peak, float(luminance.max()))
+        self.total += float(luminance.sum(dtype=np.float64))
+        self.negative += int(np.count_nonzero(pixels < 0))
+        self.above += int(np.count_nonzero(luminance > 203))
+        self.count += pixels.shape[0] * pixels.shape[1]
+
+    def result(self) -> dict:
+        count = self.count
+        return {
+            "peak_luminance_nits": round(self.peak, 3),
+            "average_luminance_nits": round(self.total / count, 3),
+            "negative_channel_fraction": round(self.negative / (count * 3), 6),
+            "above_sdr_white_fraction": round(self.above / count, 6),
+        }
+
+
 def hdr_statistics(scrgb: np.ndarray) -> dict:
-    peak, total, negative, above = 0.0, 0.0, 0, 0
+    statistics = HdrStatistics()
     rows = strip_rows(scrgb.shape[1])
     for y in range(0, scrgb.shape[0], rows):
-        pixels = scrgb[y : y + rows]
-        luminance = np.maximum(pixels @ LUMA_709, 0) * 80
-        peak = max(peak, float(luminance.max()))
-        total += float(luminance.sum(dtype=np.float64))
-        negative += int(np.count_nonzero(pixels < 0))
-        above += int(np.count_nonzero(luminance > 203))
-    count = scrgb.shape[0] * scrgb.shape[1]
-    return {
-        "peak_luminance_nits": round(peak, 3),
-        "average_luminance_nits": round(total / count, 3),
-        "negative_channel_fraction": round(negative / (count * 3), 6),
-        "above_sdr_white_fraction": round(above / count, 6),
-    }
+        statistics.add(scrgb[y : y + rows])
+    return statistics.result()

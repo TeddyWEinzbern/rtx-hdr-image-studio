@@ -7,18 +7,29 @@ from pathlib import Path
 import imagecodecs
 import numpy as np
 
+from .job_cache import staging_prefix
 from .resources import empty_image, release_image, require_memory, strip_rows
 
 
-def write_jxr(path: Path, scrgb: np.ndarray) -> Path:
-    """Keep original dimensions and every FP16 sample; never replace an existing file."""
+def write_jxr(
+    path: Path, scrgb: np.ndarray, *, staging_tag: str | None = None, trusted_range=False
+) -> Path:
+    """Keep original dimensions and every FP16 sample; never replace an existing file.
+
+    ``trusted_range`` skips the full-size finite/range pre-scan for producers that
+    are bounded by construction (the TrueHDR PQ table is finite and |scRGB| < 300).
+    ``staging_tag`` names the temporary file so the parent can remove it if the
+    worker is terminated before publication.
+    """
     if scrgb.ndim != 3 or scrgb.shape[2] != 3 or 0 in scrgb.shape:
         raise ValueError("Export requires a non-empty H x W x 3 linear scRGB array.")
+    prefix = staging_prefix(staging_tag)
     rows = strip_rows(scrgb.shape[1])
-    for y in range(0, len(scrgb), rows):
-        pixels = scrgb[y : y + rows]
-        if not np.isfinite(pixels).all() or np.max(np.abs(pixels)) > np.finfo(np.float16).max:
-            raise ValueError("Image contains non-finite or out-of-range FP16 values.")
+    if not trusted_range:
+        for y in range(0, len(scrgb), rows):
+            pixels = scrgb[y : y + rows]
+            if not np.isfinite(pixels).all() or np.max(np.abs(pixels)) > np.finfo(np.float16).max:
+                raise ValueError("Image contains non-finite or out-of-range FP16 values.")
     # The codec still uses a whole compressed blob. Reserve worst-case payload
     # headroom instead of assuming that a low-detail test image compresses well.
     require_memory(scrgb.shape[0] * scrgb.shape[1] * 8, "JPEG XR encoding")
@@ -42,7 +53,7 @@ def write_jxr(path: Path, scrgb: np.ndarray) -> Path:
         release_image(rgba)
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary = tempfile.mkstemp(prefix=".rtx-hdr-", dir=path.parent)
+    fd, temporary = tempfile.mkstemp(prefix=prefix, dir=path.parent)
     try:
         with os.fdopen(fd, "wb") as stream:
             stream.write(blob)

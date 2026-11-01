@@ -1,7 +1,8 @@
 """English desktop interface; delegates color, files, and GPU work to other layers."""
 
 import json
-import uuid
+import logging
+import threading
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer, QUrl
@@ -34,9 +35,11 @@ from PySide6.QtWidgets import (
 )
 
 from .. import __version__
+from ..decoder import DecoderClient
 from ..image_io import SUPPORTED
+from ..job_cache import create_owned_dir, jobs_root, new_job_id, purge_all_stale, remove_owned_dir
 from ..resources import gpu_capacity
-from ..runtime import cache_dir, output_dir
+from ..runtime import output_dir
 from ..settings import HdrSettings
 from .canvas import CompareCanvas
 from .controls import Parameter
@@ -97,12 +100,18 @@ class StudioWindow(QMainWindow):
         self.results: dict[str, dict] = {}
         self.outputs: dict[str, str] = {}
         self.job: JobRunner | None = None
+        # Job cache directories created by this window. Results only live in memory,
+        # so a directory no longer referenced by a result is never read again.
+        self._session_jobs: set[Path] = set()
         self.processing_source = None
         self._split_on_load = set()
         self.loading_preview = False
         self._displayed_source = None
         self._closing = False
         self.preview_device = PreviewDevice(self)
+        # Source images are decoded in helper processes that close() can kill.
+        self.preview_decoder = DecoderClient()
+        self.info_decoder = DecoderClient()
         self.preview_loader = LatestTask(self, IMAGE_POOL)
         self.preview_loader.ready.connect(self._preview_loaded)
         self.preview_loader.failed.connect(self._preview_failed)
@@ -123,6 +132,7 @@ class StudioWindow(QMainWindow):
         self.device.changed.connect(self._request_gpu)
         if QApplication.platformName() == "windows":
             QTimer.singleShot(0, self.preview_device.ensure)
+        QTimer.singleShot(0, self._start_decoders)
         for shortcut, action in (
             ("Ctrl+O", self.choose_files),
             ("Ctrl+R", self.preview),
@@ -131,6 +141,9 @@ class StudioWindow(QMainWindow):
             QShortcut(QKeySequence(shortcut), self, action)
         if initial_files:
             QTimer.singleShot(0, lambda: self.add_files(initial_files))
+        # Crash leftovers only; directories touched within 24 h may belong to another
+        # running instance. A daemon thread never delays start-up or exit.
+        threading.Thread(target=purge_all_stale, name="cache-cleanup", daemon=True).start()
 
     def _build(self):
         root = QWidget()
@@ -362,6 +375,15 @@ class StudioWindow(QMainWindow):
         self.update_notice()
         self._request_gpu()
 
+    def _start_decoders(self):
+        if self._closing:
+            return
+        for decoder in (self.preview_decoder, self.info_decoder):
+            try:
+                decoder.start()
+            except OSError as error:  # Retried on the first request.
+                logging.getLogger(__name__).warning("Cannot start image decoder: %s", error)
+
     def _request_gpu(self):
         device = self.device.value()
         if device != self._gpu_index:
@@ -422,12 +444,15 @@ class StudioWindow(QMainWindow):
         self.metadata_loader.cancel()
         self.memory_estimate.set_image(None)
         self.preview_loader.cancel()
+        self.preview_decoder.interrupt(min_seconds=0)
+        self.info_decoder.interrupt(min_seconds=0)
         self.loading_preview = False
         self._displayed_source = None
         self.files.clear()
         self.results.clear()
         self._split_on_load.clear()
         self.outputs.clear()
+        self._purge_job_dirs(keep=[self.last_log.parent] if self.last_log else ())
         self.queue.clear()
         self.canvas.set_images(QPixmap())
         self.image_title.setText("No image")
@@ -442,7 +467,7 @@ class StudioWindow(QMainWindow):
             return
         result = self.results.get(source)
         self.memory_estimate.set_image(result["info"] if result else None)
-        self.metadata_loader.submit(source_info, source)
+        self.metadata_loader.submit(source_info, source, self.info_decoder)
         if self._displayed_source != source:
             self.canvas.set_images(QPixmap())
         self.loading_preview = True
@@ -451,10 +476,26 @@ class StudioWindow(QMainWindow):
             self.canvas.mode = "before"
         self.image_title.setText(Path(source).name)
         self.image_title.setToolTip(source)
+        # A long decode of a file the user has already left is abandoned at once.
+        self._interrupt_obsolete_decodes()
+        # A quick selection can precede the one-second grace period. Check again
+        # after it expires instead of waiting for that abandoned decode to finish.
+        QTimer.singleShot(1000, self._interrupt_obsolete_decodes)
         self.preview_loader.submit(
-            load_preview, source, self.results.get(source), self.background.currentData()
+            load_preview,
+            source,
+            self.results.get(source),
+            self.background.currentData(),
+            self.preview_decoder,
         )
         self.update_notice()
+
+    def _interrupt_obsolete_decodes(self):
+        if self._closing:
+            return
+        source = self.selected_file()
+        for decoder in (self.preview_decoder, self.info_decoder):
+            decoder.interrupt(unless_path=source)
 
     def _preview_loaded(self, preview):
         if self._closing or preview.source != self.selected_file():
@@ -597,12 +638,16 @@ class StudioWindow(QMainWindow):
     def start_job(self, mode, files):
         if self.job or not files:
             return
+        job_id = new_job_id()
+        job_dir = create_owned_dir(jobs_root() / job_id)
+        self._session_jobs.add(job_dir)
         request = {
             "mode": mode,
             "files": files,
             "settings": self.current_settings().to_dict(),
             "output_dir": str(self.destination),
-            "job_dir": str(cache_dir() / "jobs" / uuid.uuid4().hex),
+            "job_dir": str(job_dir),
+            "staging_tag": job_id,
         }
         runner = JobRunner(request, self)
         self.job = runner
@@ -655,12 +700,23 @@ class StudioWindow(QMainWindow):
                 self._set_processing_source(None)
             self.status.setText(f"Failed: {Path(event['source']).name}: {event['error']}")
 
+    def _purge_job_dirs(self, keep=()):
+        """Delete this session's job directories that no result references any more."""
+        referenced = {Path(r["before"]).parent for r in self.results.values() if r.get("before")}
+        referenced.update(Path(path) for path in keep)
+        for directory in list(self._session_jobs):
+            if directory not in referenced:
+                remove_owned_dir(directory)
+                self._session_jobs.discard(directory)
+
     def job_finished(self):
         runner = self.job
         outcome = runner.outcome
         self.job = None
         self._set_processing_source(None)
         runner.deleteLater()
+        # Keep the finished job's directory for "Open job log" until the next job.
+        self._purge_job_dirs(keep=[runner.request["job_dir"]])
         self.set_busy(False)
         if outcome.get("cancelled"):
             self.status.setText("Cancelled")
@@ -741,7 +797,8 @@ class StudioWindow(QMainWindow):
             self,
             "About RTX HDR Image Studio",
             f"RTX HDR Image Studio {__version__}\nMIT License\n\n"
-            "Created with OpenAI Codex (ChatGPT), an AI coding assistant, under human direction.\n\n"
+            "Created with AI coding assistants, OpenAI Codex (ChatGPT) and Claude AI "
+            "(Anthropic), under human direction.\n\n"
             "1. Add SDR images and adjust the NVIDIA parameters.\n"
             "2. Generate a preview; drag the comparison divider.\n"
             "Use Fullscreen or double-click the image to enlarge it. Double-click or press Esc to return.\n"
@@ -771,10 +828,17 @@ class StudioWindow(QMainWindow):
         self.preview_loader.close()
         self.metadata_loader.close()
         self.gpu_loader.close()
+        # Stop in-flight decoding now; otherwise interpreter exit waits for it.
+        self.preview_decoder.close()
+        self.info_decoder.close()
         if self.fullscreen_preview is not None:
             self.fullscreen_preview.close()
         self.canvas.shutdown()
         self.preview_device.close()
+        # Results are not persisted, so none of this session's caches can be reused.
+        for directory in self._session_jobs:
+            remove_owned_dir(directory)
+        self._session_jobs.clear()
         event.accept()
 
 

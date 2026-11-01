@@ -9,6 +9,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QThread, Signal
 
+from ..job_cache import remove_staging_files
 from ..pipeline import EVENT_PREFIX
 from ..runtime import worker_environment
 
@@ -42,7 +43,8 @@ class JobRunner(QThread):
                 return
             with self._lock:
                 self._process = subprocess.Popen(
-                    [sys.executable, "-m", "rtx_hdr_studio.worker", str(request_path)],
+                    # -P: never put the job directory (cwd) on sys.path.
+                    [sys.executable, "-P", "-m", "rtx_hdr_studio.worker", str(request_path)],
                     cwd=directory,
                     env=worker_environment(),
                     stdin=subprocess.DEVNULL,
@@ -85,5 +87,8 @@ class JobRunner(QThread):
             for scratch in directory.glob("image-*"):
                 if scratch.is_dir() and not scratch.is_symlink():
                     shutil.rmtree(scratch, ignore_errors=True)
+            # A terminated export cannot run its own finally block. The staging tag
+            # was assigned by the GUI, so only this job's unpublished files match.
+            remove_staging_files(self.request.get("output_dir"), self.request.get("staging_tag"))
             if self._cancelled.is_set():
                 self.outcome = {"cancelled": True}

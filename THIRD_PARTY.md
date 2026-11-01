@@ -16,4 +16,4 @@ The MIT License covers project-authored source and documentation. It does not re
 
 Review each installed distribution's license files and upstream terms, especially NVIDIA runtime/SDK terms and Qt/PySide licensing, before redistributing a compiled or bundled application. This source release does not grant redistribution rights to proprietary dependencies. Windows Direct3D, DXGI, WIC, and display APIs are provided by Windows; no Windows system DLLs are redistributed here.
 
-The display presenter and color pipeline were adapted from this project's earlier local prototype, also developed with Codex. No user artwork, NVIDIA screenshots, private logs, copied system fonts, or SDK sample assets are included.
+The display presenter and color pipeline were adapted from this project's earlier local prototype, also developed with Codex. Version 1.2.1 changes were developed with Claude AI. No user artwork, NVIDIA screenshots, private logs, copied system fonts, or SDK sample assets are included.

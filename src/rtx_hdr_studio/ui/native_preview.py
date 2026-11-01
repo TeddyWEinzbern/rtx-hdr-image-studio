@@ -5,12 +5,11 @@ from __future__ import annotations
 import ctypes as C
 from ctypes import wintypes as W
 
-import numpy as np
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import QWidget
 
-from ..color import srgb_to_linear
 from ..graphics.directx import Presenter
+from .composition import composition_plan, divider_color, present_plan, render_region
 from .preview_tasks import LatestTask, image_to_linear, load_hdr, prepare_frames
 
 
@@ -40,7 +39,9 @@ class HdrSurface(QWidget):
         self.frame_task.failed.connect(self._async_failed)
         self.canvas.preview_device.ready.connect(self._activate)
         self.canvas.preview_device.failed.connect(self._async_failed)
+        self.canvas.preview_device.lost.connect(self._device_lost)
         self._failed = False
+        self._lost_pending = False
         self.setAttribute(Qt.WidgetAttribute.WA_NativeWindow)
         self.setAttribute(Qt.WidgetAttribute.WA_PaintOnScreen)
         self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
@@ -113,6 +114,7 @@ class HdrSurface(QWidget):
             or self.canvas.preview_device.resources is None
         ):
             return
+        self._lost_pending = False
         if not self.canvas.isVisible():
             return
         self.canvas.hdr_loading = False
@@ -145,34 +147,58 @@ class HdrSurface(QWidget):
     def invalidate(self):
         self.request_frame()
 
-    def close_renderer(self):
+    def release_renderer(self):
+        """Release the swap chain and source textures; keep the prepared frames."""
         if self.renderer:
             self.renderer.close()
             self.renderer = None
+
+    def close_renderer(self):
+        self.release_renderer()
         self.prepared = None
 
+    def _device_lost(self):
+        """The shared device is being rebuilt: drop every object created on it."""
+        self.release_renderer()
+        self._lost_pending = False
+        if self.enabled and self.canvas.hdr_active:
+            self.hide()
+            self.canvas.hdr_active = False
+            self.canvas.hdr_loading = True
+            self.canvas.update()
+            self.canvas.display_changed.emit()
+
+    def _report_device_lost(self, message):
+        self.release_renderer()
+        self._lost_pending = False
+        self.canvas.preview_device.report_lost(message)
+
+    def _plan(self, width):
+        _, _, top, image_height = self.prepared
+        return composition_plan(
+            self.canvas.mode,
+            width,
+            self.canvas.split,
+            top,
+            image_height,
+            max(1, round(self.devicePixelRatioF())),
+        )
+
+    def _divider_color(self):
+        return divider_color(self.canvas.display_info.sdr_white_nits)
+
     def compose(self, width, height):
+        """CPU reference of exactly what paintEvent asks the GPU to present."""
         if self.prepared is None or self.prepared[0].shape[:2] != (height, width):
             self.request_frame()
             return None
-        before, after, y, ih = self.prepared
-        if self.canvas.mode == "after":
-            return after
-        if self.canvas.mode == "before":
-            return before
-        boundary = min(width - 1, max(0, round(width * self.canvas.split)))
-        frame = before.copy()
-        frame[:, boundary:] = after[:, boundary:]
-        color = (
-            srgb_to_linear(np.array([152, 223, 164]) / 255)
-            * self.canvas.display_info.sdr_white_nits
-            / 80
+        copies, divider = self._plan(width)
+        return render_region(
+            self.prepared[:2], copies, divider, self._divider_color(), 0, 0, width, height
         )
-        frame[y : y + ih, boundary : boundary + max(1, round(self.devicePixelRatioF())), :3] = color
-        return frame
 
     def paintEvent(self, event):
-        if self._failed or self.after_linear is None:
+        if self._failed or self._lost_pending or self.after_linear is None:
             return
         try:
             rect = W.RECT()
@@ -180,8 +206,8 @@ class HdrSurface(QWidget):
             width, height = rect.right, rect.bottom
             if width < 1 or height < 1:
                 return
-            frame = self.compose(width, height)
-            if frame is None:
+            if self.prepared is None or self.prepared[0].shape[:2] != (height, width):
+                self.request_frame()
                 return
             if self.renderer is None:
                 resources = self.canvas.preview_device.resources
@@ -190,12 +216,29 @@ class HdrSurface(QWidget):
                 self.renderer = Presenter(int(self.winId()), width, height, resources)
             else:
                 self.renderer.resize(width, height)
-            self.renderer.upload(self.canvas.composite_overlay(frame))
+            # Full frames are uploaded once per prepared frame; a repaint (for example
+            # while dragging the divider) is GPU copies plus a few small patches.
+            before, after, _, _ = self.prepared
+            self.renderer.set_sources(self.prepared, before, after)
+            copies, divider = self._plan(width)
+            color = self._divider_color()
+            present_plan(self.renderer, width, copies, divider, color)
+            if overlay := self.canvas.overlay_rect(width, height):
+                x, y, w, h = overlay
+                patch = render_region((before, after), copies, divider, color, x, y, w, h)
+                self.canvas.blend_overlay(patch)
+                self.renderer.upload_region(x, y, patch)
             self.renderer.present()
         except Exception as error:
+            message = str(error)
+            if getattr(error, "device_lost", False):
+                # Driver reset or device removal: rebuild instead of falling back to
+                # SDR for the rest of the session. Leave paintEvent first.
+                self._lost_pending = True
+                QTimer.singleShot(0, lambda: self._report_device_lost(message))
+                return
             self._failed = True
             # Leave paintEvent before hiding/releasing the native child.
-            message = str(error)
             QTimer.singleShot(0, lambda: self.failed.emit(message))
 
     def mousePressEvent(self, event):

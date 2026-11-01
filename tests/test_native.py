@@ -206,3 +206,108 @@ def test_fullscreen_native_hdr_rendering_and_exit(tmp_path, wait_until):
     finally:
         window.close()
         app.processEvents()
+
+
+@pytest.mark.native
+@native_only
+def test_gpu_side_split_composition_matches_the_cpu_reference():
+    from rtx_hdr_studio.graphics.directx import Presenter
+    from rtx_hdr_studio.ui.composition import (
+        composition_plan,
+        divider_color,
+        present_plan,
+        render_region,
+    )
+
+    app = QApplication.instance() or QApplication([])
+    window = QWidget()
+    window.resize(211, 119)
+    renderer = Presenter(int(window.winId()), 211, 119)
+    try:
+        rng = np.random.default_rng(8)
+        before = rng.normal(1, 2, (119, 211, 4)).astype(np.float16)
+        after = rng.normal(5, 3, (119, 211, 4)).astype(np.float16)
+        before[..., 3] = after[..., 3] = 1
+        key = object()
+        renderer.set_sources(key, before, after)
+        textures = [texture.value for texture in renderer.sources]
+        renderer.set_sources(key, before, after)  # Same frame: no second upload.
+        assert [texture.value for texture in renderer.sources] == textures
+        color = divider_color(240)
+        for mode, split in (("split", 0.3), ("split", 0.0), ("after", 0.5), ("before", 0.5)):
+            copies, divider = composition_plan(mode, 211, split, 7, 100, 2)
+            present_plan(renderer, 211, copies, divider, color)
+            patch = render_region((before, after), copies, divider, color, 50, 40, 60, 20)
+            patch[..., :3] += 1
+            renderer.upload_region(50, 40, patch)
+            expected = render_region((before, after), copies, divider, color, 0, 0, 211, 119)
+            expected[40:60, 50:110] = patch
+            # Flip-discard buffers are undefined after Present; read back first.
+            np.testing.assert_array_equal(renderer.readback(), expected)
+            renderer.present()
+    finally:
+        renderer.close()
+        window.close()
+        app.processEvents()
+
+
+@pytest.mark.native
+@native_only
+def test_device_loss_rebuilds_the_hdr_preview_and_other_errors_fall_back(tmp_path, wait_until):
+    """AUD-004 fault injection: Present reports DXGI_ERROR_DEVICE_REMOVED once."""
+    from PySide6.QtGui import QColor, QPixmap
+    from PySide6.QtTest import QTest
+
+    from rtx_hdr_studio.graphics.directx import DirectXError
+    from rtx_hdr_studio.graphics.display import query_display
+    from rtx_hdr_studio.ui.window import StudioWindow
+
+    app = QApplication.instance() or QApplication([])
+    if app.platformName() != "windows":
+        pytest.skip("Set QT_QPA_PLATFORM=windows for native HDR validation")
+    window = StudioWindow()
+    window.show()
+    try:
+        assert QTest.qWaitForWindowActive(window, 3000)
+        if not query_display(int(window.canvas.winId())).hdr_active:
+            pytest.skip("Native HDR validation requires Windows HDR enabled")
+        image = QPixmap(128, 72)
+        image.fill(QColor(128, 128, 128))
+        cache = tmp_path / "hdr.npy"
+        np.save(cache, np.full((72, 128, 3), [12.5, -0.125, 2.5], np.float16))
+        window.canvas.set_images(image, image, cache)
+        canvas = window.canvas
+        wait_until(lambda: canvas.hdr_active and canvas.hdr_surface.renderer is not None, 10000)
+        surface = canvas.hdr_surface
+        old_renderer, old_device = surface.renderer, window.preview_device.resources
+
+        def removed():
+            raise DirectXError("Present HDR frame", 0x887A0005 - 2**32)
+
+        old_renderer.present = removed
+        surface.update()
+        wait_until(
+            lambda: (
+                window.preview_device.resources not in (None, old_device)
+                and canvas.hdr_active
+                and surface.renderer not in (None, old_renderer)
+                and surface.renderer.frames > 0
+            ),
+            10000,
+        )
+        assert not old_renderer.swap and not canvas.hdr_error
+        assert surface.renderer.device.value == window.preview_device.resources.device.value
+
+        # Any other failure keeps the SDR fallback and does not rebuild the device.
+        device = window.preview_device.resources
+
+        def other():
+            raise DirectXError("Present HDR frame", 0x8007000E - 2**32)
+
+        surface.renderer.present = other
+        surface.update()
+        wait_until(lambda: bool(canvas.hdr_error), 5000)
+        assert not canvas.hdr_active and window.preview_device.resources is device
+    finally:
+        window.close()
+        app.processEvents()

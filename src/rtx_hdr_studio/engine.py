@@ -1,11 +1,12 @@
 """NVIDIA adapter. GPU imports are intentionally delayed until processing starts."""
 
+import logging
 from collections.abc import Callable
 from typing import Protocol
 
 import numpy as np
 
-from .color import packed_pq_to_scrgb, srgb_to_linear
+from .color import HdrStatistics, packed_pq_to_scrgb, srgb_to_linear
 from .native_vfx import NativeVfx
 from .resources import (
     GiB,
@@ -37,7 +38,17 @@ def prepare_sdr(rgb8: np.ndarray, settings: HdrSettings) -> np.ndarray:
     return np.ascontiguousarray((linear ** (1 / 2.2)).transpose(2, 0, 1), dtype=np.float32)
 
 
+def sdr_lut(settings: HdrSettings) -> np.ndarray:
+    """The whole per-channel input chain as a 256-entry table (byte-identical)."""
+    codes = np.arange(256, dtype=np.uint8).reshape(1, 256, 1)
+    return np.rint(prepare_sdr(codes, settings)[0, 0] * 255).astype(np.uint8)
+
+
 class NvidiaEngine:
+    # The TrueHDR PQ table is finite and |scRGB| <= 125 * 2.33 < 300, far below the
+    # FP16 limit, so export may skip its full-size range pre-scan for this engine.
+    output_range_trusted = True
+
     def __init__(self, device: int = 0):
         configure_gpu()
         try:
@@ -56,6 +67,7 @@ class NvidiaEngine:
         self.name = name.decode("utf-8", errors="replace") if isinstance(name, bytes) else name
         self.effect = NativeVfx(nvvfx)
         self.failed = False
+        self.last_statistics = None
 
     def check_resources(self, width, height):
         validate_size(width, height)
@@ -75,6 +87,7 @@ class NvidiaEngine:
         if settings.device != self.device:
             raise ValueError("Settings device does not match the active GPU.")
         cp = self.cp
+        self.last_statistics = None
         height, width = rgb.shape[:2]
         self.check_resources(width, height)
         # Direct allocations avoid retaining the previous image in CuPy's pool.
@@ -92,14 +105,18 @@ class NvidiaEngine:
             )
             progress("Preparing input color")
             rows = strip_rows(width)
-            for y in range(0, height, rows):
-                source = rgb[y : y + rows]
-                rgba = np.full((*source.shape[:2], 4), 255, np.uint8)
-                rgba[..., :3] = np.rint(prepare_sdr(source, settings).transpose(1, 2, 0) * 255)
+            lut = sdr_lut(settings)
+            input_rows = strip_rows(width, 8)
+            staging = np.empty((min(input_rows, height), width, 4), np.uint8)
+            staging[..., 3] = 255
+            for y in range(0, height, input_rows):
+                strip = staging[: min(input_rows, height - y)]
+                strip[..., :3] = lut[rgb[y : y + len(strip)]]
+                # cudaMemcpy host->device is synchronous, so the buffer can be reused.
                 cp.cuda.runtime.memcpy(
-                    frame.data.ptr + y * width * 4, rgba.ctypes.data, rgba.nbytes, 1
+                    frame.data.ptr + y * width * 4, strip.ctypes.data, strip.nbytes, 1
                 )
-            del rgba, source
+            del staging, strip
             progress("Loading NVIDIA TrueHDR")
             self.effect.load(frame, output, settings)
             progress("Processing on NVIDIA RTX")
@@ -119,8 +136,14 @@ class NvidiaEngine:
             self.failed = True
             raise
         finally:
+            # After a failure the context may hold a sticky error; synchronizing
+            # again would replace the original NVIDIA message with a CUDA one.
             try:
-                cp.cuda.runtime.deviceSynchronize()
+                if not self.failed:
+                    cp.cuda.runtime.deviceSynchronize()
+            except Exception:
+                self.failed = True
+                raise
             finally:
                 self.effect.close()
                 del frame, output
@@ -128,13 +151,24 @@ class NvidiaEngine:
         progress("Converting BT.2020 / PQ to linear scRGB")
         try:
             scrgb = empty_image((height, width, 3), np.float32)
+            statistics = HdrStatistics()
             for y in range(0, height, rows):
-                scrgb[y : y + rows] = packed_pq_to_scrgb(packed[y : y + rows])
+                strip = packed_pq_to_scrgb(packed[y : y + rows])
+                scrgb[y : y + rows] = strip
+                # Same strips as hdr_statistics(), while the data is still in cache.
+                statistics.add(strip)
+            self.last_statistics = statistics.result()
             return scrgb
         finally:
             release_image(packed)
 
     def close(self) -> None:
-        if self.effect is not None:
-            self.cp.cuda.runtime.deviceSynchronize()
+        if self.effect is None:
+            return
+        try:
+            if not self.failed:
+                self.cp.cuda.runtime.deviceSynchronize()
+        except Exception:
+            logging.getLogger(__name__).exception("CUDA synchronize during close failed")
+        finally:
             self.effect.close()

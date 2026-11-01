@@ -100,24 +100,27 @@ class FullscreenCanvas(CompareCanvas):
         self._prepare_hint()
         painter.drawImage(self.hint_rect().topLeft(), self._hint_image)
 
-    def composite_overlay(self, frame):
+    def overlay_rect(self, width, height):
         if not self.hint_visible:
-            return frame
+            return None
         self._prepare_hint()
-        rgb, alpha = self._hint_linear
+        rgb, _ = self._hint_linear
         ratio = self.devicePixelRatioF()
         x, y = round(self.hint_rect().x() * ratio), round(self.hint_rect().y() * ratio)
         h, w = rgb.shape[:2]
         # Restrict blending to the hint, preserving the rest of the HDR frame exactly.
-        w, h = min(w, frame.shape[1] - x), min(h, frame.shape[0] - y)
+        w, h = min(w, width - x), min(h, height - y)
         if x < 0 or y < 0 or w <= 0 or h <= 0:
-            return frame
-        result = frame.copy()
-        patch = result[y : y + h, x : x + w, :3]
+            return None
+        return x, y, w, h
+
+    def blend_overlay(self, patch):
+        rgb, alpha = self._hint_linear
+        h, w = patch.shape[:2]
         opacity = alpha[:h, :w]
         white = self.display_info.sdr_white_nits / 80
-        patch[...] = patch.astype(np.float32) * (1 - opacity) + rgb[:h, :w] * white * opacity
-        return result
+        pixels = patch[..., :3]
+        pixels[...] = pixels.astype(np.float32) * (1 - opacity) + rgb[:h, :w] * white * opacity
 
     def mouseMoveEvent(self, event):
         if self._dragging_split:
