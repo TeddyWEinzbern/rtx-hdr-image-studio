@@ -11,8 +11,9 @@ from .canvas import CompareCanvas
 
 class FullscreenCanvas(CompareCanvas):
     exit_requested = Signal()
+    hint_finished = Signal()
 
-    def __init__(self, source, scale_mode="fit"):
+    def __init__(self, source, scale_mode="fit", show_hint=True):
         super().__init__(device=source.preview_device)
         self.mode = source.mode
         self.split = source.split
@@ -21,7 +22,7 @@ class FullscreenCanvas(CompareCanvas):
         self.scale_mode = scale_mode
         self.image_margin = 0
         self.prefer_hdr = source.prefer_hdr
-        self.hint_visible = True
+        self.hint_visible = show_hint
         self._hint_started = False
         self._hint_image = None
         self._hint_linear = None
@@ -42,13 +43,16 @@ class FullscreenCanvas(CompareCanvas):
         )
 
     def start_hint(self):
-        if not self._hint_started:
+        if self.hint_visible and not self._hint_started:
             self._hint_started = True
             self.hint_timer.start()
 
     def _hide_hint(self):
+        if not self.hint_visible:
+            return
         self.hint_visible = False
         self.update()
+        self.hint_finished.emit()
 
     def hint_rect(self):
         rect = QRect(0, 0, min(460, self.width() - 40), 72)
@@ -160,19 +164,21 @@ class FullscreenCanvas(CompareCanvas):
 
 class FullscreenPreview(QWidget):
     closed = Signal()
+    hint_finished = Signal()
 
-    def __init__(self, source, owner, scale_mode="fit"):
+    def __init__(self, source, owner, scale_mode="fit", show_hint=True):
         super().__init__(owner, Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self.setWindowTitle("Full-screen preview")
         self.setWindowModality(Qt.WindowModality.WindowModal)
         self._armed = False
         self._closed = False
-        self.canvas = FullscreenCanvas(source, scale_mode)
+        self.canvas = FullscreenCanvas(source, scale_mode, show_hint)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.canvas)
         self.canvas.exit_requested.connect(self.close)
+        self.canvas.hint_finished.connect(self.hint_finished.emit)
         self.escape = QShortcut(QKeySequence(Qt.Key.Key_Escape), self, self.close)
         self.escape.setAutoRepeat(False)
         QApplication.instance().applicationStateChanged.connect(self._application_state_changed)

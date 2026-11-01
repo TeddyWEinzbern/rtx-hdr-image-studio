@@ -197,16 +197,9 @@ class CompareCanvas(QWidget):
             painter.setPen(QColor("#d6dde7"))
             painter.setFont(QFont("Segoe UI", 13))
             painter.drawText(
-                self.rect().adjusted(20, -30, -20, 0),
+                self.rect(),
                 Qt.AlignmentFlag.AlignCenter,
                 "Drop images here",
-            )
-            painter.setFont(QFont("Segoe UI", 9))
-            painter.setPen(QColor("#7e8b9e"))
-            painter.drawText(
-                self.rect().adjusted(20, 28, -20, 0),
-                Qt.AlignmentFlag.AlignCenter,
-                "Or choose Add images - PNG / JPEG / WebP / BMP / TIFF",
             )
             return
         image_rect = self.image_rect()

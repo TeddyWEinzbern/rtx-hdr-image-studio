@@ -2,9 +2,11 @@
 
 A local Windows desktop application that applies NVIDIA TrueHDR to SDR still images, previews the result in native HDR, and exports verified FP16 linear scRGB JPEG XR (`.jxr`) files.
 
+Current source version: **1.1.1**. See [CHANGELOG.md](CHANGELOG.md) for changes.
+
 Created with **OpenAI Codex (ChatGPT)** under the direction of **TeddyWEinzbern**. This is an independent community project. See [AUTHORS.md](AUTHORS.md).
 
-![English interface with a generated gradient and SDR comparison](docs/interface.png)
+![English interface with a synthetic gradient in SDR Split view](docs/interface.png)
 
 ## Features
 
@@ -74,11 +76,13 @@ Parameter changes do not automatically re-run inference; an outdated preview is 
 
 Preview image decoding, HDR data preparation, frame resizing, and Direct3D device initialization run in the background. The window shows **Preparing preview** or **Preparing HDR preview** while those tasks finish; the rendering device is reused across previews and full-screen views. Rapid image changes discard outdated loading results.
 
-While an image is being processed, its view returns to **Original**, any full-screen view of that image closes, and its preview-mode and Fullscreen buttons are disabled. Double-click cannot reopen it until processing finishes. The image queue stays available: other unprocessed and previously processed images retain their usual viewing controls. For a batch, the restriction follows the file currently being processed and is released on completion, failure, or cancellation. Successfully completed images automatically open in **Split comparison** once their new preview loads. If another image is selected, its view stays unchanged; the completed image opens in Split comparison when next selected.
+While an image is being processed, its view returns to **Original**, any full-screen view of that image closes, and its preview-mode and Fullscreen buttons are disabled. Double-click cannot reopen it until processing finishes. The image queue stays available: other unprocessed and previously processed images retain their usual viewing controls. For a batch, the restriction follows the file currently being processed and is released on completion, failure, or cancellation. Successfully completed images automatically open in **Split view** once their new preview loads. If another image is selected, its view stays unchanged; the completed image opens in Split view when next selected.
 
-Choose the blue **Fullscreen** button below the preview, or double-click the image, to view it on its display. The image and comparison mode are fixed until you exit. In Split comparison, hold the left mouse button on the image and drag horizontally to adjust the divider; its position stays within the displayed image in all scaling modes. This adjustment applies to the current full-screen view. A centered hint explains how to exit and disappears after three seconds; mouse activity does not show it again. Double-click the image or press **Esc** to return. Switching away from the application also closes the full-screen preview. **Processed** and **Split comparison** remain disabled until the selected image has a generated preview; **Original** and full-screen viewing are available as soon as the source image is loaded.
+Choose the blue **Fullscreen** button below the preview, or double-click the image, to view it on its display. The image and comparison mode are fixed until you exit. In Split view, hold the left mouse button on the image and drag horizontally to adjust the divider; its position stays within the displayed image in all scaling modes. This adjustment applies to the current full-screen view. A centered exit hint disappears after three seconds. Once it disappears automatically, it stays hidden on subsequent entries for the rest of the current application run. Exiting before the three seconds have elapsed leaves the hint available for the next entry. Restarting the application resets it; no preference is saved. Mouse activity never restores the hint. Double-click the image or press **Esc** to return. Switching away from the application also closes the full-screen preview. **Processed** and **Split view** remain disabled until the selected image has a generated preview; **Original** and full-screen viewing are available as soon as the source image is loaded.
 
-The active preview mode is highlighted on its button. The three mode buttons stay grouped on the left in **Original / Processed / Split comparison** order; Fullscreen and its scaling selector stay on the right without stretching across a wide window. Choose **Keep aspect ratio** (default) to fit the screen, **Fill** to keep the aspect ratio and crop centrally to cover the screen, **Stretch** to fill it without preserving the aspect ratio, or **No scaling** for one preview pixel per physical display pixel, centered on screen. No scaling automatically fits while keeping aspect ratio if either image dimension exceeds the screen. Dropdowns and the image queue use light selection highlights on dark backgrounds.
+The active preview mode is highlighted on its button. The three mode buttons stay grouped on the left in **Original / Processed / Split view** order; Fullscreen and its scaling selector stay on the right without stretching across a wide window. Choose **Keep aspect ratio** (default) to fit the screen, **Fill** to keep the aspect ratio and crop centrally to cover the screen, **Stretch** to fill it without preserving the aspect ratio, or **No scaling** for one preview pixel per physical display pixel, centered on screen. No scaling automatically fits while keeping aspect ratio if either image dimension exceeds the screen. Dropdowns and the image queue use light selection highlights on dark backgrounds.
+
+Dropdown menus share the control's rounded border, font, width, and row height. They align below the control, open above it near the screen bottom, and scroll when needed. Arrow keys and Enter select an option; Esc or clicking outside dismisses the menu.
 
 | Parameter | Range | Default |
 | --- | --- | --- |
@@ -87,7 +91,7 @@ The active preview mode is highlighted on its button. The three mode buttons sta
 | Saturation | 0–200 | 100 |
 | Middle gray | 10–100 | 50 |
 | Debanding | On/off | On |
-| Input exposure | -3 to +3 EV | 0 |
+| Exposure | -3 to +3 EV | 0 |
 | Input transfer | sRGB / gamma 2.2 | sRGB |
 | Alpha background | Black / white | Black |
 | GPU index | 0–15 | 0 |

@@ -90,8 +90,13 @@ def test_fullscreen_native_hdr_rendering_and_exit(tmp_path, wait_until):
                 assert pointer == device_pointer
             device_pointer = pointer
             assert pointer == window.preview_device.resources.device.value
-            assert canvas.hint_visible
-            QTest.qWait(3100)
+            if not window._fullscreen_hint_seen:
+                assert canvas.hint_visible
+                QTest.qWait(3100)
+                assert window._fullscreen_hint_seen
+            else:
+                assert not canvas.hint_visible
+                assert not canvas.hint_timer.isActive()
             assert not canvas.hint_visible
             if mode == "split":
                 area = canvas.image_rect()

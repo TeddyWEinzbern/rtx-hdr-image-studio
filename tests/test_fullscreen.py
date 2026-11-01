@@ -90,6 +90,28 @@ def test_centered_hint_hides_after_three_seconds_and_mouse_does_not_restore_it(s
     QTest.mouseRelease(canvas, Qt.MouseButton.LeftButton, pos=QPoint(90, 60))
     assert studio.fullscreen_preview is viewer
     assert not canvas.hint_visible
+    assert studio._fullscreen_hint_seen
+    viewer.close()
+    # Completion is remembered across images and full-screen windows in this run.
+    reopened = show_preview(studio)
+    assert not reopened.canvas.hint_visible
+    assert not reopened.canvas.hint_timer.isActive()
+
+
+def test_hint_reappears_after_early_exit_and_resets_for_a_new_run(studio):
+    viewer = show_preview(studio)
+    assert viewer.canvas.hint_visible
+    viewer.close()
+    assert not studio._fullscreen_hint_seen
+    reopened = show_preview(studio)
+    assert reopened.canvas.hint_visible and reopened.canvas.hint_timer.isActive()
+    reopened.close()
+    studio._fullscreen_hint_seen = True
+    fresh_window = StudioWindow()
+    try:
+        assert not fresh_window._fullscreen_hint_seen
+    finally:
+        fresh_window.close()
 
 
 @pytest.mark.parametrize("scaling", ["fit", "fill", "stretch", "actual"])

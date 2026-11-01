@@ -18,7 +18,6 @@ from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
     QCheckBox,
-    QComboBox,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -30,7 +29,6 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSizePolicy,
-    QStyledItemDelegate,
     QVBoxLayout,
     QWidget,
 )
@@ -41,6 +39,7 @@ from ..runtime import cache_dir, output_dir
 from ..settings import HdrSettings
 from .canvas import CompareCanvas
 from .controls import Parameter
+from .dropdown import Dropdown
 from .fullscreen import FullscreenPreview
 from .jobs import JobRunner
 from .preview_tasks import LatestTask, PreviewDevice, load_preview
@@ -66,8 +65,12 @@ QPushButton#primary { background: #8bd89a; color: #12251a; font-weight: 600; }
 QPushButton#fullscreen { background: #75b9e8; color: #102536; border-color: #92ceef; font-weight: 600; }
 QPushButton#fullscreen:hover { background: #9ad1f2; }
 QPushButton#fullscreen:disabled { color: #75808d; background: #202731; border-color: #435064; }
-QComboBox, QDoubleSpinBox, QLineEdit { background: #11171f; padding: 5px; border: 1px solid #46546a; border-radius: 5px; }
-QComboBox QAbstractItemView { background: #1c222b; color: #e6eaf1; selection-background-color: #8bd89a; selection-color: #12251a; outline: 0; }
+QDoubleSpinBox, QLineEdit { background: #11171f; padding: 5px; border: 1px solid #46546a; border-radius: 5px; }
+QComboBox { background: #11171f; min-height: 20px; padding: 5px 8px 5px 10px; border: 1px solid #46546a; border-radius: 5px; }
+QComboBox::drop-down { subcontrol-origin: padding; subcontrol-position: top right; width: 26px; border: none; background: transparent; }
+QComboBox::down-arrow { image: url("@dropdown-arrow@"); width: 10px; height: 10px; }
+QComboBox QAbstractItemView { background: #11171f; color: #e6eaf1; border: 1px solid #46546a; border-radius: 5px; padding: 4px; font: 13px "Segoe UI"; selection-background-color: #8bd89a; selection-color: #12251a; outline: 0; }
+QComboBox QAbstractItemView::item { padding: 0 6px; border-radius: 3px; }
 QComboBox QAbstractItemView::item:selected { background: #8bd89a; color: #12251a; }
 QLabel#title { font-size: 24px; font-weight: 600; }
 QLabel#muted { color: #a6b1c1; }
@@ -79,7 +82,7 @@ QSlider::sub-page:horizontal { background: #8bd89a; }
 QSlider::handle:horizontal { background: #b7e6c0; width: 12px; margin: -5px 0; border-radius: 5px; }
 QProgressBar { background: #283241; border: none; height: 5px; }
 QProgressBar::chunk { background: #8bd89a; }
-"""
+""".replace("@dropdown-arrow@", (Path(__file__).parent / "icons" / "chevron-down.png").as_posix())
 
 
 class StudioWindow(QMainWindow):
@@ -103,12 +106,11 @@ class StudioWindow(QMainWindow):
         self.preview_loader.ready.connect(self._preview_loaded)
         self.preview_loader.failed.connect(self._preview_failed)
         self.fullscreen_preview: FullscreenPreview | None = None
+        self._fullscreen_hint_seen = False
         self.destination = output_dir()
         self.last_log: Path | None = None
         self._applying = False
         self._build()
-        for combo in self.findChildren(QComboBox):
-            combo.setItemDelegate(QStyledItemDelegate(combo))
         self.setStyleSheet(STYLE)
         self.apply_settings(HdrSettings())
         if QApplication.platformName() == "windows":
@@ -131,7 +133,7 @@ class StudioWindow(QMainWindow):
         heading = QLabel("RTX HDR Image Studio")
         heading.setObjectName("title")
         outer.addWidget(heading)
-        subtitle = QLabel("Local NVIDIA TrueHDR processing | Native HDR preview | FP16 JPEG XR")
+        subtitle = QLabel("NVIDIA TrueHDR | HDR preview | FP16 linear scRGB JXR")
         subtitle.setObjectName("muted")
         outer.addWidget(subtitle)
         toolbar = QHBoxLayout()
@@ -139,7 +141,7 @@ class StudioWindow(QMainWindow):
         self.preview_button = self.button("Generate preview", self.preview, toolbar)
         self.export_button = self.button("Export JXR", self.export, toolbar)
         self.export_button.setObjectName("primary")
-        self.open_button = self.button("Open HDR result", self.open_result, toolbar)
+        self.open_button = self.button("Open result", self.open_result, toolbar)
         self.cancel_button = self.button("Cancel", self.cancel, toolbar)
         self.cancel_button.hide()
         toolbar.addStretch()
@@ -155,9 +157,9 @@ class StudioWindow(QMainWindow):
         self.clear_button = self.button("Clear queue", self.clear_files, left)
         body.addLayout(left)
         center = QVBoxLayout()
-        self.image_title = QLabel("Add an SDR image to begin")
+        self.image_title = QLabel("No image")
         center.addWidget(self.image_title)
-        self.image_info = QLabel("Original dimensions are preserved on export.")
+        self.image_info = QLabel()
         self.image_info.setWordWrap(True)
         center.addWidget(self.image_info)
         self.canvas = CompareCanvas(device=self.preview_device)
@@ -171,12 +173,13 @@ class StudioWindow(QMainWindow):
         for title, mode in (
             ("Original", "before"),
             ("Processed", "after"),
-            ("Split comparison", "split"),
+            ("Split view", "split"),
         ):
             self.view_buttons[mode] = self.button(
                 title, lambda checked=False, m=mode: self.set_view(m), views
             )
             self.view_buttons[mode].setCheckable(True)
+            self.view_buttons[mode].setFixedWidth(100)
             self.view_buttons[mode].setSizePolicy(
                 QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
             )
@@ -190,7 +193,7 @@ class StudioWindow(QMainWindow):
         self.fullscreen_button.setObjectName("fullscreen")
         self.fullscreen_button.setToolTip("View fullscreen, or double-click the image")
         self.fullscreen_button.setFixedWidth(160)
-        self.fullscreen_scale = QComboBox()
+        self.fullscreen_scale = Dropdown()
         self.fullscreen_scale.setAccessibleName("Fullscreen scaling mode")
         self.fullscreen_scale.addItem("Keep aspect ratio", "fit")
         self.fullscreen_scale.addItem("Fill", "fill")
@@ -204,7 +207,7 @@ class StudioWindow(QMainWindow):
         )
         fullscreen_controls.addWidget(self.fullscreen_scale)
         display = QHBoxLayout()
-        self.display_mode = QComboBox()
+        self.display_mode = Dropdown()
         self.display_mode.setAccessibleName("Preview display mode")
         self.display_mode.addItem("Automatic HDR", True)
         self.display_mode.addItem("SDR tone-mapped", False)
@@ -233,7 +236,7 @@ class StudioWindow(QMainWindow):
         content = QWidget()
         content.setObjectName("settings")
         right = QVBoxLayout(content)
-        self.preset = QComboBox()
+        self.preset = Dropdown()
         self.preset.setAccessibleName("HDR preset")
         self.preset.addItems([*PRESETS, "Custom"])
         self.preset.currentTextChanged.connect(self.choose_preset)
@@ -253,7 +256,7 @@ class StudioWindow(QMainWindow):
             ("middle_gray", "Middle gray", 10, 100, "", "NVIDIA middle-gray reference."),
             (
                 "exposure",
-                "Input exposure",
+                "Exposure",
                 -3,
                 3,
                 " EV",
@@ -274,14 +277,14 @@ class StudioWindow(QMainWindow):
         self.debanding = QCheckBox("NVIDIA debanding")
         self.debanding.stateChanged.connect(self.parameter_changed)
         right.addWidget(self.debanding)
-        self.transfer = QComboBox()
-        self.transfer.addItem("Standard sRGB input", "srgb")
-        self.transfer.addItem("Gamma 2.2 encoded input", "gamma22")
+        self.transfer = Dropdown()
+        self.transfer.addItem("Standard sRGB", "srgb")
+        self.transfer.addItem("Gamma 2.2 encoded", "gamma22")
         self.transfer.currentIndexChanged.connect(self.parameter_changed)
         right.addWidget(self.transfer)
-        self.background = QComboBox()
-        self.background.addItem("Composite alpha on black", "black")
-        self.background.addItem("Composite alpha on white", "white")
+        self.background = Dropdown()
+        self.background.addItem("Alpha on black", "black")
+        self.background.addItem("Alpha on white", "white")
         self.background.currentIndexChanged.connect(self.parameter_changed)
         right.addWidget(self.background)
         self.device = Parameter(
@@ -293,18 +296,13 @@ class StudioWindow(QMainWindow):
         self.button("Save preset", self.save_preset, presets)
         self.button("Load preset", self.load_preset, presets)
         right.addLayout(presets)
-        self.button("Reset parameters", lambda: self.apply_settings(HdrSettings()), right)
+        self.button("Reset", lambda: self.apply_settings(HdrSettings()), right)
         right.addWidget(QLabel("Output directory"))
         self.output_field = QLineEdit(str(self.destination))
         self.output_field.setReadOnly(True)
         right.addWidget(self.output_field)
         self.button("Choose directory", self.choose_output, right)
         self.button("Open output directory", self.open_output, right)
-        note = QLabel(
-            "FP16 linear scRGB JXR\nOriginal size | No automatic resizing\nExisting files are never overwritten"
-        )
-        note.setWordWrap(True)
-        right.addWidget(note)
         right.addStretch()
         self.settings_panel.setWidget(content)
         body.addWidget(self.settings_panel)
@@ -314,7 +312,7 @@ class StudioWindow(QMainWindow):
         self.progress.setTextVisible(False)
         outer.addWidget(self.progress)
         footer = QHBoxLayout()
-        self.status = QLabel("Ready. Processing stays on this computer.")
+        self.status = QLabel("Ready")
         self.status.setWordWrap(True)
         footer.addWidget(self.status, 1)
         self.log_button = self.button("Open job log", self.open_log, footer)
@@ -400,8 +398,8 @@ class StudioWindow(QMainWindow):
         self.outputs.clear()
         self.queue.clear()
         self.canvas.set_images(QPixmap())
-        self.image_title.setText("Add an SDR image to begin")
-        self.image_info.setText("Original dimensions are preserved on export.")
+        self.image_title.setText("No image")
+        self.image_info.clear()
         self.set_busy(False)
         self.update_notice()
 
@@ -482,14 +480,21 @@ class StudioWindow(QMainWindow):
         ):
             return
         self.fullscreen_preview = FullscreenPreview(
-            self.canvas, self, self.fullscreen_scale.currentData()
+            self.canvas,
+            self,
+            self.fullscreen_scale.currentData(),
+            show_hint=not self._fullscreen_hint_seen,
         )
         self.fullscreen_preview.source = self.selected_file()
+        self.fullscreen_preview.hint_finished.connect(self._fullscreen_hint_finished)
         self.fullscreen_preview.closed.connect(self._fullscreen_closed)
         self.fullscreen_preview.showFullScreen()
 
     def _fullscreen_closed(self):
         self.fullscreen_preview = None
+
+    def _fullscreen_hint_finished(self):
+        self._fullscreen_hint_seen = True
 
     def _selected_processing(self):
         return self.processing_source is not None and self.processing_source == self.selected_file()
@@ -521,40 +526,30 @@ class StudioWindow(QMainWindow):
         display = canvas.display_info
         if self.loading_preview:
             self.display_status.setText("Preparing preview...")
-            note = "Loading the selected image in the background."
         elif canvas.hdr_loading:
             self.display_status.setText("Preparing HDR preview...")
-            note = "The SDR preview remains available while HDR is prepared in the background."
         elif canvas.hdr_active:
-            self.display_status.setText(f"Native HDR | {display.bits}-bit output")
-            note = "HDR highlights and wide-gamut values are displayed directly. The original matches the Windows SDR white level."
+            self.display_status.setText(f"HDR | {display.bits}-bit")
         elif canvas.hdr_error:
-            self.display_status.setText("SDR fallback: HDR surface unavailable")
-            note = "Toggle preview display mode to retry. Details are in the application log."
+            self.display_status.setText("SDR fallback")
         elif not canvas.prefer_hdr:
-            self.display_status.setText("SDR tone-mapped preview")
-            note = "Choose Automatic HDR to use an HDR-enabled display."
+            self.display_status.setText("SDR preview")
         elif display.hdr_active:
-            self.display_status.setText("HDR ready | Generate a preview")
-            note = "Generate a preview to display native HDR in this window."
+            self.display_status.setText("HDR Ready")
         else:
-            self.display_status.setText(f"SDR preview | Display mode: {display.color_mode}")
-            note = (
-                "Native HDR requires an HDR display with Windows HDR enabled. ACM alone is not HDR."
-            )
+            self.display_status.setText("SDR preview")
+        note = ""
         result = self.results.get(self.selected_file())
         if result:
             if result["settings"] != self.current_settings().to_dict():
-                note = (
-                    "Parameters changed. Generate a preview to update the previous result.\n" + note
-                )
+                note = "Preview outdated"
             else:
-                note = (
-                    f"Image peak: {result['statistics']['peak_luminance_nits']:.0f} nit.\n" + note
-                )
+                note = f"Peak: {result['statistics']['peak_luminance_nits']:.0f} nit"
         self.notice.setText(note)
+        self.notice.setVisible(bool(note))
         self.display_status.setToolTip(
-            f"{display.name}\nSDR white: {display.sdr_white_nits:.0f} nit\n{display.error}"
+            f"{display.name}\nMode: {display.color_mode}\n"
+            f"SDR white: {display.sdr_white_nits:.0f} nit\n{canvas.hdr_error or display.error}"
         )
 
     def preview(self):
@@ -632,9 +627,9 @@ class StudioWindow(QMainWindow):
         runner.deleteLater()
         self.set_busy(False)
         if outcome.get("cancelled"):
-            self.status.setText("Cancelled. Completed exports are retained.")
+            self.status.setText("Cancelled")
         elif outcome.get("event") == "error":
-            self.status.setText("Processing failed. Open the job log for details.")
+            self.status.setText("Processing failed")
             QMessageBox.warning(self, "Processing failed", outcome["message"])
         else:
             results = outcome.get("results", [])
